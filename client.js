@@ -174,18 +174,18 @@ window.__ModuleLoader__.load({
 .aav-summary { cursor: pointer; padding: 6px 10px; font-size: 11px; color: var(--dsw-alias-label-secondary); }
 .aav-err { color: var(--dsw-alias-state-error-primary); }
 .aav-empty { padding: 24px; color: var(--dsw-alias-label-secondary); text-align: center; }
-/* Footer entry geometry mirrors the shipped sidebar rows: a fixed-height flex
-   row that fills the sidebar width. Measured without this (v1.0.2): the entry
-   fell back to inline-block auto sizing and landed at 31x145px, outside the
-   sidebar's visible band, so it "rendered but could not be seen". */
-.aav-footerBtn { display: flex; box-sizing: border-box; align-items: center; justify-content: center; gap: 8px;
-  width: 100%; min-width: 0; height: 32px; padding: 0 10px; margin: 0;
+/* Footer entry geometry. Deliberately an icon-only square in BOTH sidebar
+   states: the foot is the sidebar's most crowded strip (memory plugin +
+   session manager + this entry), and a full-width row here pushes entries
+   past the column edge. Measured evidence for the original failure: the
+   button rendered at 31x145px because its stylesheet had not mounted at all,
+   and the row itself overflows whenever any entry asks for more width. */
+.aav-footerBtn { display: inline-flex; box-sizing: border-box; align-items: center; justify-content: center;
+  width: 36px; min-width: 36px; max-width: 36px; height: 36px; padding: 0; margin: 0;
   font: inherit; font-size: 13px; line-height: 1; white-space: nowrap; overflow: hidden;
   color: var(--dsw-alias-label-primary); background: transparent; border: none; border-radius: 8px; cursor: pointer; }
 .aav-footerBtn:hover { background: var(--dsw-alias-bg-layer-2); }
-.aav-footerBtnRail { width: 36px; min-width: 36px; height: 36px; padding: 0; }
-.aav-footerBtnWide { justify-content: flex-start; }
-.aav-footerLabel { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.aav-footerBtnRail, .aav-footerBtnWide { width: 36px; min-width: 36px; max-width: 36px; height: 36px; padding: 0; }
 `;
 
     /** Icon: an archive box with a magnifier — "read the archive". */
@@ -404,7 +404,7 @@ window.__ModuleLoader__.load({
             store.set({ open: true });
             if (store.state.listPhase !== 'loading') loadSessions();
           }
-        }, h(Icon, { size: wide ? 15 : 18 }), wide ? h('span', { className: 'aav-footerLabel' }, label) : null),
+        }, h(Icon, { size: wide ? 15 : 18 })),
         h(Dialog, { t, onRestore: props.onRestore }));
     }
 
@@ -515,7 +515,7 @@ window.__ModuleLoader__.load({
               store.set({ open: true });
               if (store.state.listPhase !== 'loading') loadSessions();
             }
-          }, h(Icon, { size: wide ? 15 : 18 }), wide ? h('span', { className: 'aav-footerLabel' }, label) : null));
+          }, h(Icon, { size: wide ? 15 : 18 })));
       }
     }
 
@@ -632,3 +632,5 @@ window.__ModuleLoader__.load({
     };
   }
 });
+
+

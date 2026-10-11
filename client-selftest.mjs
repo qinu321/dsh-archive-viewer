@@ -155,17 +155,24 @@ const wideButtons = wideElements.filter(element => element.type === 'button');
 check('footer entry renders exactly one button', wideButtons.length === 1, String(wideButtons.length));
 check('the button carries a localized aria-label', wideButtons[0]?.props?.['aria-label'] === '归档会话查看器' || typeof wideButtons[0]?.props?.['aria-label'] === 'string',
   String(wideButtons[0]?.props?.['aria-label']));
-const hasLabelSpan = wideElements.some(element => element.type === 'span'
-  && (element.props?.children === '归档会话查看器' || (Array.isArray(element.props?.children) && element.props.children.includes('归档会话查看器'))));
-check('the wide button shows its localized label', hasLabelSpan,
-  JSON.stringify(wideElements.filter(element => element.type === 'span').map(element => element.props?.children)).slice(0, 120));
+// The foot is the sidebar's most crowded strip: the entry is an icon-only
+// square in both states, and must never ask for a share of the row's width.
+check('the button renders as a fixed-size icon', (() => {
+  const kids = wideButtons[0]?.props?.children;
+  const list = Array.isArray(kids) ? kids : [kids];
+  return list.some(child => child !== null && typeof child === 'object' && child.type === 'svg');
+})(), JSON.stringify(wideButtons[0]?.props?.children).slice(0, 120));
+check('the wide state renders no text label', !wideElements.some(element => element.type === 'span'
+  && (element.props?.children === '归档会话查看器' || (Array.isArray(element.props?.children) && element.props.children.includes('归档会话查看器')))),
+  'a label span is still rendered');
 check('the entry renders a dialog element', wideElements.some(element => element.type === 'dialog'));
 const styleElement = wideElements.find(element => element.type === 'style');
 const styleText = String(styleElement?.props?.children ?? '');
 check('the entry injects its own stylesheet', styleText.includes('.aav-footerBtn') && styleText.length > 500, String(styleText.length));
-check('the footer button pins an explicit row height', /\.aav-footerBtn\s*\{[^}]*height:\s*32px/.test(styleText), 'no height:32px rule');
-check('the wide label is a single ellipsized line', /\.aav-footerLabel\s*\{[^}]*white-space:\s*nowrap/.test(styleText), 'no nowrap rule');
-check('the rail variant keeps a 36px square', /\.aav-footerBtnRail\s*\{[^}]*width:\s*36px/.test(styleText), 'no rail rule');
+check('the footer button pins its own 36px square', /\.aav-footerBtn\s*\{[^}]*width:\s*36px[^}]*height:\s*36px/.test(styleText), 'no 36px square rule');
+check('the footer button cannot be squeezed or stretched', /\.aav-footerBtn\s*\{[^}]*min-width:\s*36px[^}]*max-width:\s*36px/.test(styleText), 'no min/max-width clamp');
+check('both sidebar states keep the same square', /\.aav-footerBtnRail,\s*\.aav-footerBtnWide\s*\{[^}]*width:\s*36px/.test(styleText), 'no shared rail/wide rule');
+check('the button geometry is box-sizing-safe', /\.aav-footerBtn\s*\{[^}]*box-sizing:\s*border-box/.test(styleText), 'no border-box rule');
 
 let railError;
 try { slotRegistration.component({ ...ownerProps, wide: false }); } catch (error) { railError = error; }
