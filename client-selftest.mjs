@@ -1,4 +1,12 @@
 /**
+
+const styleElement = wideElements.find(element => element.type === 'style');
+const styleText = String(styleElement?.props?.children ?? '');
+check('the entry injects its own stylesheet', styleText.includes('.aav-footerBtn') && styleText.length > 500, String(styleText.length));
+check('the footer button pins an explicit row height', /\.aav-footerBtn\s*\{[^}]*height:\s*32px/.test(styleText), 'no height:32px rule');
+check('the wide label is set to a single ellipsized line', /\.aav-footerLabel\s*\{[^}]*white-space:\s*nowrap/.test(styleText), 'no nowrap rule');
+check('the rail variant keeps a 36px square', /\.aav-footerBtnRail\s*\{[^}]*width:\s*36px/.test(styleText), 'no rail rule');
+/**
  * Offline client-half harness for dsh-archive-viewer.
  *
  * Loads client.js the way the browser loader does (one `__ModuleLoader__.load`
@@ -152,6 +160,12 @@ const hasLabelSpan = wideElements.some(element => element.type === 'span'
 check('the wide button shows its localized label', hasLabelSpan,
   JSON.stringify(wideElements.filter(element => element.type === 'span').map(element => element.props?.children)).slice(0, 120));
 check('the entry renders a dialog element', wideElements.some(element => element.type === 'dialog'));
+const styleElement = wideElements.find(element => element.type === 'style');
+const styleText = String(styleElement?.props?.children ?? '');
+check('the entry injects its own stylesheet', styleText.includes('.aav-footerBtn') && styleText.length > 500, String(styleText.length));
+check('the footer button pins an explicit row height', /\.aav-footerBtn\s*\{[^}]*height:\s*32px/.test(styleText), 'no height:32px rule');
+check('the wide label is a single ellipsized line', /\.aav-footerLabel\s*\{[^}]*white-space:\s*nowrap/.test(styleText), 'no nowrap rule');
+check('the rail variant keeps a 36px square', /\.aav-footerBtnRail\s*\{[^}]*width:\s*36px/.test(styleText), 'no rail rule');
 
 let railError;
 try { slotRegistration.component({ ...ownerProps, wide: false }); } catch (error) { railError = error; }
