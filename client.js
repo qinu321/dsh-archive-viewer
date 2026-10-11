@@ -437,6 +437,37 @@ window.__ModuleLoader__.load({
           if (node === null || node === undefined) { report(stage, JSON.stringify({ hasButton: false })); return; }
           const rect = node.getBoundingClientRect();
           const style = window.getComputedStyle ? window.getComputedStyle(node) : undefined;
+          // Walk up from the button so the report covers the whole footer row,
+          // not just this entry: the user reports the session-manager button
+          // overflowing the sidebar and squashing the memory button, which is
+          // container-level, not specific to this plugin.
+          const row = node.parentElement;
+          const box = (element) => {
+            if (element === null || element === undefined) return null;
+            const r = element.getBoundingClientRect();
+            const s = window.getComputedStyle ? window.getComputedStyle(element) : undefined;
+            return {
+              cls: String(element.className ?? '').slice(0, 60),
+              rect: [Math.round(r.width), Math.round(r.height), Math.round(r.top), Math.round(r.left)],
+              display: s?.display,
+              flex: s?.flex,
+              width: s?.width,
+              minWidth: s?.minWidth,
+              overflow: s?.overflow,
+              whiteSpace: s?.whiteSpace,
+              text: String(element.textContent ?? '').trim().slice(0, 18)
+            };
+          };
+          const siblings = row === null || row === undefined ? [] : [...row.children].map(box);
+          const findSidebar = () => {
+            let current = node.parentElement;
+            while (current !== null && current !== undefined) {
+              if (/sidebar/i.test(String(current.className ?? '')) || current.hasAttribute?.('data-dsh-sidebar')) return current;
+              current = current.parentElement;
+            }
+            return null;
+          };
+          const sidebar = findSidebar();
           report(stage, JSON.stringify({
             wide,
             hasButton: true,
@@ -456,7 +487,10 @@ window.__ModuleLoader__.load({
             // Whether our own stylesheet reached the document at all.
             styleTags: document.querySelectorAll('style').length,
             hasOurRule: [...document.querySelectorAll('style')].some(tag => String(tag.textContent).includes('.aav-footerBtn')),
-            inSidebar: node.closest('[data-dsh-sidebar], [data-testid=sidebar], .dsw-sidebar') !== null
+            inSidebar: sidebar !== null,
+            sidebar: box(sidebar),
+            row: box(row),
+            siblings
           }));
         };
         const timer = window.setTimeout(() => measure('entry:measured'), 1800);
