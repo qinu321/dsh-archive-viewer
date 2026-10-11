@@ -35,6 +35,17 @@ DSH 的官方界面**不允许把已归档会话显示为当前视图**（`dsh-c
 `GET /archive-viewer/api/workspaces`、`POST /archive-viewer/api/unarchive`。
 `/transcript` 对**不在归档集里**的会话直接拒绝（409），避免变成第二个会话阅读器。
 
+## 页面侧诊断（图标 / 弹窗排查用）
+
+有些失败只存在于浏览器里（Client 工厂没跑、`apply` 抛错、渲染抛错、图标不在 DOM 里），从外面看不见 ——
+因此留了一条**只读的页面→宿主诊断通道**：
+
+- `POST /archive-viewer/api/diagnostic`：页面把观察到的状态报上来；宿主**只留在内存**（不落盘、不碰会话状态）；
+- `GET /archive-viewer/api/diagnostic`：读回最后一份报告；
+- Client 半边在三个点自动上报：**工厂启动**（`factory:start`）、**注册完成**（`apply:registered`）、**渲染抛错**（`render:crash`）；
+- `page-diagnostic.js` 是更全的一次性探针：整份粘进 DSH 页面的 DevTools 控制台，它会检查模块加载器、slot 条目、
+  侧边栏底部 DOM 与自身路由可达性，然后自动 POST 回宿主（同时 `console.log` 一份）。
+
 ## 安装 / 卸载
 
 ```

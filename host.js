@@ -491,6 +491,8 @@ export function apply(ctx, config = {}) {
   const dshHome = resolveDshHome(configDshHome(config));
   const sessionsRoot = join(dshHome, "sessions");
   let artifactCache = { at: 0, index: new Map() };
+  /** Last page-side diagnostic report; memory only, replaced on every post. */
+  let lastDiagnostic = null;
   const artifacts = async () => {
     const now = Date.now();
     if (now - artifactCache.at > SCAN_TTL_MS) {
@@ -556,6 +558,24 @@ export function apply(ctx, config = {}) {
           const sessionId = assertSessionId(body?.sessionId ?? "");
           await ctx.workspaceRegistry.unarchiveSession(sessionId);
           return sendJson(res, 200, { ok: true, result: { sessionId, archived: false } });
+        }
+
+        // Page-side diagnostics: the Client half and the paste-once probe post
+        // what only the browser can observe (factory execution, render failure,
+        // footer DOM). Read-only for the Host: capped, kept in memory, never
+        // written to disk, and no session state is touched.
+        if (req.method === "POST" && path === "/diagnostic") {
+          const raw = await readBody(req, 512 * 1024);
+          if (raw.trim() === "") return sendJson(res, 400, { ok: false, error: "缺少诊断内容" });
+          let body;
+          try { body = JSON.parse(raw); }
+          catch { return sendJson(res, 400, { ok: false, error: "诊断内容不是合法 JSON" }); }
+          lastDiagnostic = { receivedAt: new Date().toISOString(), report: body };
+          return sendJson(res, 200, { ok: true, result: { stored: true } });
+        }
+
+        if (req.method === "GET" && path === "/diagnostic") {
+          return sendJson(res, 200, { ok: true, result: lastDiagnostic });
         }
 
         return sendJson(res, 404, { ok: false, error: `未知端点 ${req.method} ${path}` });

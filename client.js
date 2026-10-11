@@ -19,6 +19,28 @@ window.__ModuleLoader__.load({
     const API = '/archive-viewer/api';
     const NS = 'archive-viewer';
 
+    /**
+     * Fire-and-forget page-side diagnostics. The Host keeps the last report in
+     * memory and exposes it on GET /archive-viewer/api/diagnostic, so a failure
+     * that only exists inside the browser (factory never ran, apply threw,
+     * render threw, icon missing from the DOM) is readable from the outside
+     * instead of guessed at. Never throws into the caller.
+     */
+    const report = (stage, detail) => {
+      try {
+        void fetch(`${API}/diagnostic`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            stage,
+            detail: detail === undefined ? undefined : String(detail && detail.stack || detail),
+            at: new Date().toISOString()
+          })
+        }).catch(() => {});
+      } catch { /* diagnostics must never break the plugin */ }
+    };
+    report('factory:start');
+
     /** Small external store so the dialog and the footer button stay in sync. */
     const store = {
       state: {
@@ -378,6 +400,33 @@ window.__ModuleLoader__.load({
         h(Dialog, { t, onRestore: props.onRestore }));
     }
 
+    /**
+     * Slot entry wrapper. A throw inside the entry would otherwise be swallowed
+     * by the slot's boundary and leave the footer silently empty — the exact
+     * symptom that is being chased right now — so the failure is reported back
+     * to the Host and a bare icon-only fallback keeps the panel reachable.
+     */
+    function SlotEntry(props) {
+      const t = props.t;
+      const wide = props.wide === true;
+      try {
+        return h(FooterAction, props);
+      } catch (error) {
+        report('render:crash', error);
+        const label = t('footer.label');
+        return h('button', {
+          type: 'button',
+          className: 'aav-footerBtn ' + (wide ? 'aav-footerBtnWide' : 'aav-footerBtnRail'),
+          'aria-label': label,
+          title: wide ? undefined : label,
+          onClick: () => {
+            store.set({ open: true });
+            if (store.state.listPhase !== 'loading') loadSessions();
+          }
+        }, h(Icon, { size: wide ? 15 : 18 }), wide ? h('span', null, label) : null);
+      }
+    }
+
     return {
       inject: ['slots', 'locale', 'uiWorkspace'],
       apply(ctx) {
@@ -483,7 +532,8 @@ window.__ModuleLoader__.load({
           id: 'archive-viewer-footer',
           order: 31,
           locale: NS
-        }, (ownerProps) => h(FooterAction, { ...ownerProps, onRestore: restore })));
+        }, (ownerProps) => h(SlotEntry, { ...ownerProps, onRestore: restore })));
+        report('apply:registered');
       }
     };
   }

@@ -205,6 +205,10 @@ check("POST /unarchive calls the registry", restored.status === 200 && unarchive
 
 const unknown = await call(`${API_PREFIX}/nope`);
 check("an unknown endpoint answers 404", unknown.status === 404);
+const diagPost = await call(`${API_PREFIX}/diagnostic`, { stage: "factory:start", at: "now" });
+check("POST /diagnostic stores a page report", diagPost.status === 200 && diagPost.payload?.result?.stored === true, JSON.stringify(diagPost.payload));
+const diagGet = await call(`${API_PREFIX}/diagnostic`);
+check("GET /diagnostic returns the last report", diagGet.payload?.result?.report?.stage === "factory:start", JSON.stringify(diagGet.payload).slice(0, 160));
 
 const brokenQuery = { ...fakeCtx, sessionQuery: { ...fakeCtx.sessionQuery, readSession: async () => { throw new Error("log unreadable"); } } };
 let brokenHandler;
