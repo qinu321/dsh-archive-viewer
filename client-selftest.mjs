@@ -147,7 +147,10 @@ const wideButtons = wideElements.filter(element => element.type === 'button');
 check('footer entry renders exactly one button', wideButtons.length === 1, String(wideButtons.length));
 check('the button carries a localized aria-label', wideButtons[0]?.props?.['aria-label'] === '归档会话查看器' || typeof wideButtons[0]?.props?.['aria-label'] === 'string',
   String(wideButtons[0]?.props?.['aria-label']));
-check('the wide button shows its localized label', JSON.stringify(wideTree).includes('归档会话查看器'), JSON.stringify(wideTree).slice(0, 160));
+const hasLabelSpan = wideElements.some(element => element.type === 'span'
+  && (element.props?.children === '归档会话查看器' || (Array.isArray(element.props?.children) && element.props.children.includes('归档会话查看器'))));
+check('the wide button shows its localized label', hasLabelSpan,
+  JSON.stringify(wideElements.filter(element => element.type === 'span').map(element => element.props?.children)).slice(0, 120));
 check('the entry renders a dialog element', wideElements.some(element => element.type === 'dialog'));
 
 let railError;
@@ -189,3 +192,4 @@ check('diagnostics post to the plugin own route', posted.every(entry => entry.ur
 console.log(results.join("\n"));
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${results.length - failures}/${results.length} checks`);
 process.exit(failures === 0 ? 0 : 1);
+
