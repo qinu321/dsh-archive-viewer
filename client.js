@@ -181,6 +181,11 @@ window.__ModuleLoader__.load({
    button rendered at 31x145px because its stylesheet had not mounted at all,
    and the row itself overflows whenever any entry asks for more width. */
 .aav-footerBtn { display: inline-flex; box-sizing: border-box; align-items: center; justify-content: center;
+  /* A stacking escape hatch: measured on this machine the footer row is
+     264px + 33px + 36px wide inside a 280px column, so the last entry can be
+     painted under a sibling or clipped. Raising the z-index keeps this entry
+     clickable without changing the row's layout. */
+  position: relative; z-index: 5;
   width: 36px; min-width: 36px; max-width: 36px; height: 36px; padding: 0; margin: 0;
   font: inherit; font-size: 13px; line-height: 1; white-space: nowrap; overflow: hidden;
   color: var(--dsw-alias-label-primary); background: transparent; border: none; border-radius: 8px; cursor: pointer; }
