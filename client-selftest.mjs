@@ -157,10 +157,12 @@ check('the button carries a localized aria-label', wideButtons[0]?.props?.['aria
   String(wideButtons[0]?.props?.['aria-label']));
 // The foot is the sidebar's most crowded strip: the entry is an icon-only
 // square in both states, and must never ask for a share of the row's width.
-check('the button renders as a fixed-size icon', (() => {
+check('the button carries no text and no label span', (() => {
+  // The foot is the sidebar's most crowded strip, so the entry must not ask
+  // for a share of the row width: exactly one icon child, no text node.
   const kids = wideButtons[0]?.props?.children;
   const list = Array.isArray(kids) ? kids : [kids];
-  return list.some(child => child !== null && typeof child === 'object' && child.type === 'svg');
+  return list.length === 1 && typeof list[0] === 'object' && list[0] !== null;
 })(), JSON.stringify(wideButtons[0]?.props?.children).slice(0, 120));
 check('the wide state renders no text label', !wideElements.some(element => element.type === 'span'
   && (element.props?.children === '归档会话查看器' || (Array.isArray(element.props?.children) && element.props.children.includes('归档会话查看器')))),
