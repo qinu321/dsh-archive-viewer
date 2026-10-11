@@ -80,6 +80,13 @@ const kinds = built.items.map(item => item.kind);
 check("fold keeps every renderable row", built.items.length === 9, JSON.stringify(kinds));
 check("user row carries the message text", built.items[0].kind === "user" && built.items[0].text === "hello");
 check("injected user-approval becomes an injected row", built.items[1].kind === "injected" && built.items[1].label === "user-approval");
+const contextRows = buildRows([
+  { type: "user/message", seq: 1, time: 1, data: { content: [{ type: "text", text: "<system-reminder>rules</system-reminder>" }], source: { kind: "user" } } },
+  { type: "user/message", seq: 2, time: 2, data: { content: [{ type: "text", text: "Current runtime context. cwd: E:\\x" }], source: { kind: "user" } } },
+  { type: "user/message", seq: 3, time: 3, data: { content: [{ type: "text", text: "真正手打的话" }], source: { kind: "user" } } }
+], undefined);
+check("system-reminder and runtime-context messages are labelled injected", contextRows.items.filter(item => item.kind === "injected").length === 2, JSON.stringify(contextRows.items.map(item => item.kind)));
+check("a typed prompt stays a user row", contextRows.items.filter(item => item.kind === "user").length === 1 && contextRows.items.find(item => item.kind === "user").text === "真正手打的话");
 const assistant = built.items[2];
 check("assistant text comes from the stream, not the message fallback", assistant.text === "say hi", JSON.stringify(assistant.text));
 check("assistant reasoning comes from the stream", assistant.reasoning === "think ", JSON.stringify(assistant.reasoning));

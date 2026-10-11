@@ -246,10 +246,18 @@ export function buildRows(events, header) {
     switch (event.type) {
       case "user/message": {
         const kind = data.source?.kind;
-        if (kind === "system-prompt" || kind === "user-approval" || kind === "delegation") {
-          rows.push({ ...base, kind: "injected", label: kind, text: clip(contentText(data.content)) });
+        const text = contentText(data.content);
+        // Harness-injected context (runtime snapshot, workspace instructions,
+        // skill catalog, hook notices) also arrives as a user message. Keep it
+        // visible — the model read it — but label it so real typed prompts stay
+        // distinguishable in a long transcript.
+        const injected = kind === "system-prompt" || kind === "user-approval" || kind === "delegation"
+          || text.startsWith("<system-reminder>")
+          || text.startsWith("Current runtime context.");
+        if (injected) {
+          rows.push({ ...base, kind: "injected", label: kind ?? "context", text: clip(text) });
         } else {
-          rows.push({ ...base, kind: "user", text: clip(contentText(data.content)), source: kind ?? "user" });
+          rows.push({ ...base, kind: "user", text: clip(text), source: kind ?? "user" });
         }
         break;
       }
