@@ -424,14 +424,6 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         if (announced.current) return;
         announced.current = true;
-        // The workspace-level probe stays armed (one POST per page load is
-        // negligible and layout bugs are invisible from the Host); the noisy
-        // per-mount detail only runs when a diagnostic session is requested.
-        const probing = (() => {
-          try { return window.localStorage.getItem('dsh-archive-viewer:probe') === '1'; }
-          catch { return false; }
-        })();
-        if (!probing) return undefined;
         const measure = (stage) => {
           const node = buttonRef.current;
           if (node === null || node === undefined) { report(stage, JSON.stringify({ hasButton: false })); return; }
