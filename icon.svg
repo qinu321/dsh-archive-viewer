@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" role="img" aria-label="Archived session viewer">
+  <g fill="none" stroke="#2f7fd8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="3" y="4" width="13" height="4" rx="1"/>
+    <path d="M4.5 8v10.5A1.5 1.5 0 0 0 6 20h5"/>
+    <path d="M6.5 12h5"/>
+  </g>
+  <g fill="none" stroke="#f0a020" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="16" cy="15" r="4"/>
+    <path d="M19 18l2.5 2.5"/>
+  </g>
+</svg>

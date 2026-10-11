@@ -1,0 +1,43 @@
+{
+  "name": "dsh-archive-viewer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Read-only viewer for archived DSH sessions: browse the archive list and read a full transcript without unarchiving. | 归档会话只读查看器：不取消归档即可浏览归档列表、阅读完整对话与工具调用。",
+  "type": "module",
+  "main": "./host.js",
+  "exports": {
+    ".": "./host.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "host.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/en.json",
+    "locale/zh.json",
+    "icon.svg",
+    "README.md",
+    "selftest.mjs"
+  ],
+  "icon": "./icon.svg",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "scripts": {
+    "check": "node --check host.js && node --check client.js",
+    "test": "node selftest.mjs"
+  }
+}

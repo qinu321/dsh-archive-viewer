@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-archive-viewer
+      name: dsh-archive-viewer
+      config: {}
