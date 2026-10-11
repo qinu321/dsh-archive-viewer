@@ -433,6 +433,7 @@ window.__ModuleLoader__.load({
         const dictionaries = {
           zh: {
             'panel.title': '归档会话查看器',
+            'footer.label': '归档会话查看器',
             'panel.count': '共 {n} 条已归档',
             'action.refresh': '刷新',
             'action.close': '关闭',
@@ -468,6 +469,7 @@ window.__ModuleLoader__.load({
           },
           en: {
             'panel.title': 'Archived session viewer',
+            'footer.label': 'Archived sessions',
             'panel.count': '{n} archived',
             'action.refresh': 'Refresh',
             'action.close': 'Close',
