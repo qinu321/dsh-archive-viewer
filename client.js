@@ -389,6 +389,7 @@ window.__ModuleLoader__.load({
       return h(React.Fragment, null,
         h('button', {
           type: 'button',
+          ref: props.buttonRef ?? null,
           className: 'aav-footerBtn ' + (wide ? 'aav-footerBtnWide' : 'aav-footerBtnRail'),
           'aria-label': label,
           title: wide ? undefined : label,
@@ -409,13 +410,44 @@ window.__ModuleLoader__.load({
     function SlotEntry(props) {
       const t = props.t;
       const wide = props.wide === true;
+      const buttonRef = React.useRef(null);
+      const announced = React.useRef(false);
+      // One mount announcement per page: proves whether the entry really
+      // rendered and how much space the sidebar gave it. Never repeats.
+      useEffect(() => {
+        if (announced.current) return;
+        announced.current = true;
+        const measure = (stage) => {
+          const node = buttonRef.current;
+          if (node === null || node === undefined) { report(stage, JSON.stringify({ hasButton: false })); return; }
+          const rect = node.getBoundingClientRect();
+          const style = window.getComputedStyle ? window.getComputedStyle(node) : undefined;
+          report(stage, JSON.stringify({
+            wide,
+            hasButton: true,
+            // isConnected separates "React rendered it" from "the shell kept it".
+            connected: node.isConnected === true,
+            rect: [Math.round(rect.width), Math.round(rect.height), Math.round(rect.top), Math.round(rect.left)],
+            clientRects: node.getClientRects ? node.getClientRects().length : undefined,
+            display: style?.display,
+            visibility: style?.visibility,
+            opacity: style?.opacity,
+            color: style?.color,
+            label: node.getAttribute('aria-label') || '',
+            parentClass: String(node.parentElement?.className ?? '')
+          }));
+        };
+        const timer = window.setTimeout(() => measure('entry:measured'), 1800);
+        return () => window.clearTimeout(timer);
+      }, [wide]);
       try {
-        return h(FooterAction, props);
+        return h(FooterAction, { ...props, buttonRef });
       } catch (error) {
         report('render:crash', error);
         const label = t('footer.label');
         return h('button', {
           type: 'button',
+          ref: buttonRef,
           className: 'aav-footerBtn ' + (wide ? 'aav-footerBtnWide' : 'aav-footerBtnRail'),
           'aria-label': label,
           title: wide ? undefined : label,
