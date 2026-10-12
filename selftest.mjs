@@ -288,6 +288,55 @@ const third = await listArchived({ workspaceRegistry: registry, sessionQuery: ca
 check("a rewritten log is folded again", foldCalls.length === 2, `folds=${foldCalls.length}`);
 check("the refolded title replaces the cached one", third.sessions[0].title === "t-2", String(third.sessions[0].title));
 
+// --- 5d. the checkpoint path must avoid the fold entirely ------------------
+// This is the path DSH's own session list uses (zero-I/O listing read). When a
+// matching checkpoint exists, the list must not touch the log at all.
+const checkpointFolds = [];
+const checkpointQuery = {
+  ...fakeCtx.sessionQuery,
+  readTitleSnapshots: async (ids) => { checkpointFolds.push([...ids]); return []; }
+};
+const checkpointCache = {
+  cachedSnapshot: (header) => (String(header.id) === ARCHIVED_ID ? { asOfSeq: 5, values: { title: { title: "来自检查点的标题" } } } : undefined)
+};
+const fastList = await listArchived({
+  workspaceRegistry: registry,
+  sessionQuery: checkpointQuery,
+  sessionsRoot: "unused",
+  artifactIndex: cacheArtifacts,
+  titleCache: new Map(),
+  projectionCache: checkpointCache
+});
+check("a checkpoint title is used as-is", fastList.sessions[0].title === "来自检查点的标题", String(fastList.sessions[0].title));
+check("a checkpoint title needs no fold", checkpointFolds.length === 0, `folds=${JSON.stringify(checkpointFolds)}`);
+check("the checkpoint path reports zero fold time", fastList.timings.foldMs === 0, JSON.stringify(fastList.timings));
+check("the title is labelled as coming from the checkpoint", fastList.sessions[0].titleSource === "checkpoint", String(fastList.sessions[0].titleSource));
+
+// A session the checkpoint does not cover still falls back to the fold.
+const partial = await listArchived({
+  workspaceRegistry: { ...registry, archivedSessionIds: [ARCHIVED_ID, "session-other"] },
+  sessionQuery: { ...checkpointQuery, readTitleSnapshots: async (ids) => { checkpointFolds.push([...ids]); return ids.map(id => ({ sessionId: id, status: "fulfilled", value: { title: { title: "折叠标题" } } })); } },
+  sessionsRoot: "unused",
+  artifactIndex: new Map([...cacheArtifacts, ["session-other", { path: "y", bytes: 10, mtime: 5, project: "p" }]]),
+  titleCache: new Map(),
+  projectionCache: checkpointCache
+});
+check("only the uncovered session is folded", checkpointFolds.length === 1 && checkpointFolds[0].length === 1 && checkpointFolds[0][0] === "session-other", JSON.stringify(checkpointFolds));
+check("both sessions end up with titles", partial.sessions.every(session => session.title !== ""), JSON.stringify(partial.sessions.map(session => [session.id, session.title, session.titleSource])));
+
+// Our own fingerprint-verified fold outranks a possibly older checkpoint.
+const fingerprintCache = new Map([[ARCHIVED_ID, { title: "日志里更新的标题", mtimeMs: 1000, bytes: 100 }]]);
+const fresh = await listArchived({
+  workspaceRegistry: registry,
+  sessionQuery: checkpointQuery,
+  sessionsRoot: "unused",
+  artifactIndex: cacheArtifacts,
+  titleCache: fingerprintCache,
+  projectionCache: checkpointCache
+});
+check("a fingerprint-fresh fold wins over the checkpoint", fresh.sessions[0].title === "日志里更新的标题" && fresh.sessions[0].titleSource === "fold",
+  JSON.stringify([fresh.sessions[0].title, fresh.sessions[0].titleSource]));
+
 // --- 6. client artifact ---------------------------------------------------
 const clientSource = readFileSync(new URL("./client.js", import.meta.url), "utf8");
 check("client registers through the module loader", clientSource.includes("__ModuleLoader__.load"));
@@ -338,6 +387,7 @@ if (process.env.ARCHIVE_VIEWER_LIVE === "1") {
 console.log(results.join("\n"));
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${results.length - failures}/${results.length} checks`);
 process.exit(failures === 0 ? 0 : 1);
+
 
 
 
