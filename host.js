@@ -17,7 +17,7 @@
  * asked for a "restore and continue" escape hatch and is only ever called from
  * an explicit button in the viewer.
  */
-import { readdir, stat } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
@@ -66,6 +66,19 @@ const ARTIFACT_NAMES = [
 
 /** How long one `<dshHome>/sessions` directory walk is reused. */
 const SCAN_TTL_MS = 15000;
+/**
+ * The persisted projection-cache directory, read as the cheap title source.
+ * Measured on this library: reading all 52 checkpoint rows costs ~14ms, while
+ * folding a title out of the log costs ~44ms PER SESSION (2.3s for the whole
+ * archive). The live `sessionProjectionCache` service is tried first; this
+ * direct read covers a cold in-memory table, and every value is accepted only
+ * after its identity fields match the header DSH itself supplied.
+ */
+const PROJECTION_CACHE_SEGMENTS = ["storages", "session_projcache", "sessions"];
+/** Default sessions returned per list page; the client asks for more on demand. */
+const DEFAULT_LIST_LIMIT = 50;
+/** Hard cap so one request can never ask for an unbounded page. */
+const MAX_LIST_LIMIT = 500;
 /** Per-block character cap for rendered transcript text. */
 const MAX_BLOCK_CHARS = 8000;
 /** Most recent transcript rows returned for one read. */
@@ -154,9 +167,42 @@ export async function scanSessionArtifacts(root) {
   return index;
 }
 
+/**
+ * Read one session's folded title straight from its persisted projection
+ * checkpoint — the cheap path, no log inflation.
+ *
+ * Every acceptance is guarded by the same identity the official
+ * `cachedSnapshot` face checks (format version, createdAt, cwd, isSeeded), so a
+ * value can lag the log but can never come from a different session or an older
+ * format generation whose fold semantics differed. Anything that does not match
+ * returns undefined and the caller falls back to the log.
+ *
+ * @param cacheDir - resolved `<dshHome>/storages/session_projcache/sessions`.
+ * @param header - the header DSH itself supplied for this session.
+ * @returns the stored title, or undefined when the row cannot be trusted.
+ */
+export async function readCachedTitle(cacheDir, header) {
+  if (header === undefined || header === null) return undefined;
+  let parsed;
+  try {
+    const raw = await readFile(join(cacheDir, `${header.id}.json`), "utf8");
+    parsed = JSON.parse(raw);
+  } catch { return undefined; }
+  const record = parsed?.record;
+  const rows = record?.rows;
+  const title = rows?.title?.val;
+  if (typeof title !== "string" || title === "") return undefined;
+  const identity = record?.identity;
+  if (identity === undefined || identity === null) return undefined;
+  if (identity.formatVersion !== header.version) return undefined;
+  if (identity.createdAt !== header.createdAt) return undefined;
+  if (identity.isSeeded !== header.isSeeded) return undefined;
+  if (header.cwd !== undefined && identity.cwd !== header.cwd) return undefined;
+  return title;
+}
+
 /** `{ type, seq, time, data }` JSONL lines of an artifact, header included. */
-export function parseSessionLines(content) {
-  const lines = content.split("\n");
+export function parseSessionLines(content) {  const lines = content.split("\n");
   const events = [];
   let header;
   for (const line of lines) {
@@ -485,7 +531,7 @@ export async function transcriptFor(sessionQuery, sessionId) {
 /** Archive-list payload: registry membership, workspace title, folded title,
  * artifact statistics. Persistence-derived values are best-effort per id so
  * one unreadable session cannot fail the whole list. */
-export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRoot, artifactIndex, titleCache, projectionCache, timings }) {
+export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRoot, artifactIndex, titleCache, projectionCache, projectionCacheDir, dshHome, page, timings }) {
   const mark = () => Date.now();
   const spent = {};
   const started = mark();
@@ -499,33 +545,61 @@ export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRo
   spent.registryMs = mark() - started;
 
   const records = new Map();
+  let filterError;
+  let filterFirstFields = [];
   if (sessionQuery !== undefined && typeof sessionQuery.filterSessions === "function") {
     const from = mark();
     try {
       const found = await sessionQuery.filterSessions([{ kind: "id", values: archivedIds }]);
       for (const record of found ?? []) records.set(String(record.header?.id), record);
-    } catch { /* annotation-free listing falls back to the filesystem scan */ }
+      filterFirstFields = found !== undefined && found.length > 0 ? Object.keys(found[0] ?? {}) : [];
+    } catch (error) { filterError = safeErrorMessage(error); }
     spent.filterMs = mark() - from;
   }
+  spent.filterRecords = records.size;
+  spent.filterFirstFields = filterFirstFields;
+  if (filterError !== undefined) spent.filterError = filterError;
 
   const from = mark();
   const index = artifactIndex ?? await scanSessionArtifacts(sessionsRoot);
   spent.scanMs = mark() - from;
 
-  // Titles, in order of cost (cheap path first):
-  //   1. the persisted projection checkpoint — the zero-I/O read DSH's own
-  //      session list uses (`cachedSnapshot(header, ['title'])`). It is what
-  //      makes that list appear instantly; its value may lag the log but is
-  //      never from another session.
-  //   2. our own fold, cached against the artifact's stat fingerprint.
-  //   3. folding a session whose log changed (a rename), refolded on its own.
-  // Measured before this: folding all 51 archived artifacts (63.9MB) cost
-  // ~2.3s per request, which was essentially the whole 2.7s list latency.
+  // One page only: every per-session cost below (titles, folding) is bounded by
+  // the page size, so latency stays flat while the archive grows. `hasMore`
+  // tells the reader there is another page.
+  const pageSize = Number.isSafeInteger(page) && page > 0 ? Math.min(page, MAX_LIST_LIMIT) : DEFAULT_LIST_LIMIT;
+  const pageIds = archivedIds.slice(0, pageSize);
+
+  // Titles, cheapest source first. Measured here: reading all 52 persisted
+  // checkpoints costs ~14ms, while folding one title out of a log costs ~44ms
+  // per session (2.3s for the archive, and it grows with the archive).
+  //   1. the live `sessionProjectionCache.cachedSnapshot` face (zero I/O);
+  //   2. the same checkpoint read straight off disk, identity-checked;
+  //   3. our own fold, cached against the artifact's stat fingerprint;
+  //   4. folding a log that actually changed (a rename).
+  // Only the requested page is resolved, so the cost is bounded by the page
+  // size no matter how large the archive grows.
   const titles = new Map();
   const fromCache = new Set();
+
+  // Settle our own fingerprint-verified folds first: that value was read from
+  // the log itself and is therefore never older than a checkpoint, so a stale
+  // checkpoint must not shadow it.
+  const ownVerified = new Set();
+  for (const id of pageIds) {
+    const artifact = index.get(id);
+    const own = titleCache?.get(id);
+    if (own !== undefined && artifact !== undefined && own.mtimeMs === artifact.mtime && own.bytes === artifact.bytes) {
+      titles.set(id, own.title);
+      ownVerified.add(id);
+    }
+  }
+
+  // 1. the live checkpoint face (zero I/O) — tried even for verified ids, since
+  //    a newer title there is strictly better than an older fold of ours.
+  const viewFrom = mark();
   if (projectionCache !== undefined && typeof projectionCache.cachedSnapshot === "function") {
-    const viewFrom = mark();
-    for (const id of archivedIds) {
+    for (const id of pageIds) {
       const header = records.get(id)?.header;
       if (header === undefined) continue;
       try {
@@ -535,30 +609,38 @@ export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRo
           titles.set(id, title);
           fromCache.add(id);
         }
-      } catch { /* a missing checkpoint just falls through to the fold */ }
+      } catch { /* a missing checkpoint just falls through */ }
     }
-    spent.cachedTitleMs = mark() - viewFrom;
-  } else {
-    spent.cachedTitleMs = 0;
   }
-  // A cached title never errors, but the fold is still the only source for
-  // sessions the checkpoint does not cover, so it stays as the second path.
+  spent.cachedTitleMs = mark() - viewFrom;
+
+  // 2. the same checkpoint straight off disk, identity-checked. Our own
+  //    fingerprint-settled values skip it: they already came from this log.
+  const diskFrom = mark();
+  const cacheDir = projectionCacheDir ?? join(dshHome ?? "", ...PROJECTION_CACHE_SEGMENTS);
+  for (const id of pageIds) {
+    if (ownVerified.has(id) || (titles.has(id) && fromCache.has(id))) continue;
+    const header = records.get(id)?.header;
+    if (header === undefined) continue;
+    const title = await readCachedTitle(cacheDir, header);
+    if (title !== undefined) {
+      titles.set(id, title);
+      fromCache.add(id);
+    }
+  }
+  spent.checkpointDiskMs = mark() - diskFrom;
+
+  // 3. anything still unresolved is folded from its log below.
   const stale = [];
-  for (const id of archivedIds) {
-    const artifact = index.get(id);
-    const entry = titleCache?.get(id);
-    if (entry !== undefined && artifact !== undefined && entry.mtimeMs === artifact.mtime && entry.bytes === artifact.bytes) {
-      // Our own fingerprint says the log has not changed since the fold: trust
-      // it over a possibly older checkpoint.
-      titles.set(id, entry.title);
-      fromCache.delete(id);
-    } else if (!fromCache.has(id)) {
-      stale.push(id);
-    }
+  for (const id of pageIds) {
+    if (titles.has(id)) continue;
+    stale.push(id);
   }
-  spent.titleCacheHits = archivedIds.length - stale.length;
+  // "hits" counts everything already served without a fold.
+  spent.titleCacheHits = pageIds.length - stale.length;
   spent.titleCacheMisses = stale.length;
   spent.titlesFromCheckpoint = fromCache.size;
+  spent.pageIds = pageIds.length;
 
   if (stale.length > 0 && sessionQuery !== undefined && typeof sessionQuery.readTitleSnapshots === "function") {
     const foldFrom = mark();
@@ -581,7 +663,7 @@ export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRo
     spent.foldMs = 0;
   }
 
-  const sessions = archivedIds.map(id => {
+  const sessions = pageIds.map(id => {
     const record = records.get(id);
     const artifact = index.get(id);
     const workspaceId = workspaceBySession.get(id);
@@ -597,8 +679,8 @@ export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRo
       formatStatus: record?.formatStatus ?? undefined,
       bytes: artifact?.bytes ?? undefined,
       mtime: artifact?.mtime ?? undefined,
-      // "checkpoint" = read from the persisted projection row (instant, may lag
-      // the log); "fold" = actually read out of the log; "none" = no title.
+      // "checkpoint" = read from a persisted projection row (instant, may lag
+      // the log); "fold" = read out of the log; "none" = no title found.
       titleSource: titles.has(id) ? (fromCache.has(id) ? "checkpoint" : "fold") : "none"
     };
   });
@@ -606,7 +688,15 @@ export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRo
   spent.totalMs = mark() - started;
   spent.archived = archivedIds.length;
   if (timings !== undefined) Object.assign(timings, spent);
-  return { sessions, archivedCount: archivedIds.length, timings: spent };
+  return {
+    sessions,
+    archivedCount: archivedIds.length,
+    total: archivedIds.length,
+    hasMore: archivedIds.length > pageIds.length,
+    // Folded per page in newest-first order, so "load more" walks the archive
+    // without ever resolving more titles than the page it is showing.
+    timings: spent
+  };
 }
 
 /**
@@ -651,6 +741,7 @@ export function apply(ctx, config = {}) {
           // opens rely on the fingerprint cache and stay fast.
           const force = url.searchParams.get("refresh") === "1";
           if (force) titleCache.clear();
+          const rawLimit = Number(url.searchParams.get("limit") ?? "");
           const artifactIndex = await artifacts(force);
           const result = await listArchived({
             workspaceRegistry: ctx.workspaceRegistry,
@@ -658,8 +749,11 @@ export function apply(ctx, config = {}) {
             sessionsRoot,
             artifactIndex,
             titleCache,
-            // The zero-I/O listing read DSH's own session list is built on.
-            projectionCache: ctx.get("sessionProjectionCache")
+            // The zero-I/O listing read DSH's own session list is built on, plus
+            // the same checkpoint read straight off disk for a cold table.
+            projectionCache: ctx.get("sessionProjectionCache"),
+            projectionCacheDir: join(dshHome, ...PROJECTION_CACHE_SEGMENTS),
+            page: Number.isSafeInteger(rawLimit) && rawLimit > 0 ? rawLimit : undefined
           });
           return sendJson(res, 200, { ok: true, result });
         }

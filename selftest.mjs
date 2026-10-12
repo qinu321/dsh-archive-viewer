@@ -324,7 +324,7 @@ const partial = await listArchived({
 check("only the uncovered session is folded", checkpointFolds.length === 1 && checkpointFolds[0].length === 1 && checkpointFolds[0][0] === "session-other", JSON.stringify(checkpointFolds));
 check("both sessions end up with titles", partial.sessions.every(session => session.title !== ""), JSON.stringify(partial.sessions.map(session => [session.id, session.title, session.titleSource])));
 
-// Our own fingerprint-verified fold outranks a possibly older checkpoint.
+// Our own fingerprint-verified fold outranks the on-disk checkpoint.
 const fingerprintCache = new Map([[ARCHIVED_ID, { title: "日志里更新的标题", mtimeMs: 1000, bytes: 100 }]]);
 const fresh = await listArchived({
   workspaceRegistry: registry,
@@ -332,10 +332,70 @@ const fresh = await listArchived({
   sessionsRoot: "unused",
   artifactIndex: cacheArtifacts,
   titleCache: fingerprintCache,
+  projectionCache: undefined
+});
+check("a fingerprint-fresh fold wins over the on-disk checkpoint", fresh.sessions[0].title === "日志里更新的标题" && fresh.sessions[0].titleSource === "fold",
+  JSON.stringify([fresh.sessions[0].title, fresh.sessions[0].titleSource]));
+
+// A live checkpoint beats a fold of ours that the checkpoint has since passed:
+// the live table is runtime state, the fold is a snapshot of the log we read.
+const both = await listArchived({
+  workspaceRegistry: registry,
+  sessionQuery: checkpointQuery,
+  sessionsRoot: "unused",
+  artifactIndex: cacheArtifacts,
+  titleCache: fingerprintCache,
   projectionCache: checkpointCache
 });
-check("a fingerprint-fresh fold wins over the checkpoint", fresh.sessions[0].title === "日志里更新的标题" && fresh.sessions[0].titleSource === "fold",
-  JSON.stringify([fresh.sessions[0].title, fresh.sessions[0].titleSource]));
+check("the live checkpoint wins when both know a title", both.sessions[0].title === "来自检查点的标题" && both.sessions[0].titleSource === "checkpoint",
+  JSON.stringify([both.sessions[0].title, both.sessions[0].titleSource]));
+
+// --- 5e. paging bounds the per-session work -------------------------------
+// Latency must not grow with the archive: only the requested page may be
+// resolved, and the fold must never see an id outside it.
+const manyIds = ["session-a", "session-b", "session-c", "session-d", "session-e", "session-f"];
+const manyArtifacts = new Map(manyIds.map((id, index) => [id, { path: id, bytes: 10, mtime: index + 1, project: "p" }]));
+const manyQuery = {
+  ...fakeCtx.sessionQuery,
+  filterSessions: async (filters) => (filters[0]?.values ?? []).map(id => ({ header: { id, cwd: "E:\\\\x", createdAt: 100, agentPreset: "standard", version: 4, isSeeded: false }, live: false, persisted: true })),
+  readTitleSnapshots: async (ids) => ids.map(id => ({ sessionId: id, status: "fulfilled", value: { title: { title: `folded-${id}` } } }))
+};
+const paged = await listArchived({
+  workspaceRegistry: { archivedSessionIds: manyIds, list: () => [] },
+  sessionQuery: manyQuery,
+  sessionsRoot: "unused",
+  artifactIndex: manyArtifacts,
+  titleCache: new Map(),
+  projectionCache: undefined,
+  page: 2
+});
+check("a page returns only the requested size", paged.sessions.length === 2, String(paged.sessions.length));
+check("a page never folds a session outside it", paged.sessions.every(session => manyIds.slice(0, 2).includes(session.id)), JSON.stringify(paged.sessions.map(session => session.id)));
+check("the total still reports the whole archive", paged.total === 6 && paged.archivedCount === 6, JSON.stringify([paged.total, paged.archivedCount]));
+check("hasMore marks that another page exists", paged.hasMore === true);
+check("the timings show the page size", paged.timings.pageIds === 2, JSON.stringify(paged.timings));
+
+const lastPage = await listArchived({
+  workspaceRegistry: { archivedSessionIds: manyIds, list: () => [] },
+  sessionQuery: manyQuery,
+  sessionsRoot: "unused",
+  artifactIndex: manyArtifacts,
+  titleCache: new Map(),
+  projectionCache: undefined,
+  page: 6
+});
+check("the last page reports no more", lastPage.hasMore === false && lastPage.sessions.length === 6, JSON.stringify([lastPage.hasMore, lastPage.sessions.length]));
+
+const capped = await listArchived({
+  workspaceRegistry: { archivedSessionIds: manyIds, list: () => [] },
+  sessionQuery: manyQuery,
+  sessionsRoot: "unused",
+  artifactIndex: manyArtifacts,
+  titleCache: new Map(),
+  projectionCache: undefined,
+  page: 100000
+});
+check("an oversized page request is capped, not honoured", capped.sessions.length === 6, String(capped.sessions.length));
 
 // --- 6. client artifact ---------------------------------------------------
 const clientSource = readFileSync(new URL("./client.js", import.meta.url), "utf8");
@@ -387,6 +447,8 @@ if (process.env.ARCHIVE_VIEWER_LIVE === "1") {
 console.log(results.join("\n"));
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${results.length - failures}/${results.length} checks`);
 process.exit(failures === 0 ? 0 : 1);
+
+
 
 
 

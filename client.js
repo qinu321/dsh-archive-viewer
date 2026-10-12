@@ -61,6 +61,10 @@ window.__ModuleLoader__.load({
       state: {
         open: false,
         sessions: [],
+        listTotal: 0,
+        listHasMore: false,
+        // Page size requested from the Host; grows by one page per 'load more'.
+        listLimit: 50,
         listPhase: 'idle',
         listError: '',
         query: '',
@@ -128,8 +132,15 @@ window.__ModuleLoader__.load({
       try {
         // A manual refresh drops the Host's title/scan caches; ordinary opens
         // reuse them so the list paints without re-inflating any session log.
-        const result = await api(options.force ? '/sessions?refresh=1' : '/sessions');
-        store.set({ sessions: result.sessions || [], listPhase: 'ready' });
+        const limit = options.limit ?? store.state.listLimit;
+        const query = `/sessions?limit=`;
+        const result = await api(query);
+        store.set({
+          sessions: result.sessions || [],
+          listTotal: result.total ?? result.archivedCount ?? (result.sessions || []).length,
+          listHasMore: result.hasMore === true,
+          listPhase: 'ready'
+        });
       } catch (error) {
         store.set({ listPhase: 'error', listError: error.message });
       }
@@ -199,6 +210,7 @@ window.__ModuleLoader__.load({
   white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; max-height: 420px; overflow: auto; }
 .aav-summary { cursor: pointer; padding: 6px 10px; font-size: 11px; color: var(--dsw-alias-label-secondary); }
 .aav-err { color: var(--dsw-alias-state-error-primary); }
+.aav-loadMore { text-align: center; color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); }
 .aav-empty { padding: 24px; color: var(--dsw-alias-label-secondary); text-align: center; }
 /* Footer entry geometry. Deliberately an icon-only square in BOTH sidebar
    states: the foot is the sidebar's most crowded strip (memory plugin +
@@ -387,6 +399,15 @@ window.__ModuleLoader__.load({
           state.sessions.length === 0 ? t('empty.archive') : t('empty.filtered')));
       }
 
+      const loadMore = state.listHasMore
+        ? h('button', {
+            key: 'more',
+            type: 'button',
+            className: 'aav-row aav-loadMore',
+            onClick: () => loadSessions({ limit: store.state.listLimit + 50 })
+          }, t('action.loadMore', { n: state.listTotal - state.sessions.length }))
+        : null;
+
       const rows = filtered.map(session => {
         const meta = [
           formatTime(session.createdAt),
@@ -414,14 +435,14 @@ window.__ModuleLoader__.load({
           onChange: (event) => store.set({ query: event.target.value })
         }));
 
-      const side = h('div', { className: 'aav-side' }, search, h('div', { className: 'aav-list' }, listStatus, rows));
+      const side = h('div', { className: 'aav-side' }, search, h('div', { className: 'aav-list' }, listStatus, rows, loadMore));
       const main = h('div', { className: 'aav-main' }, h(Transcript, { t, state, session: selected, onRestore }));
       const body = h('div', { className: 'aav-body' }, side, main);
 
       const header = h('div', { className: 'aav-head' },
         h(Icon, { size: 18 }),
         h('h2', null, t('panel.title')),
-        h('span', { className: 'aav-headSub' }, t('panel.count', { n: state.sessions.length })),
+        h('span', { className: 'aav-headSub' }, t('panel.count', { shown: state.sessions.length, n: state.listTotal })),
         h('span', { className: 'aav-spacer' }),
         h('button', { type: 'button', className: 'aav-btn', onClick: () => loadSessions({ force: true }) }, t('action.refresh')),
         h('button', { type: 'button', className: 'aav-btn', onClick: onClose }, t('action.close')));
@@ -596,8 +617,9 @@ window.__ModuleLoader__.load({
           zh: {
             'panel.title': '归档会话查看器',
             'footer.label': '归档会话查看器',
-            'panel.count': '共 {n} 条已归档',
+            'panel.count': '已列出 {shown} / 共 {n} 条',
             'action.refresh': '刷新',
+            'action.loadMore': '加载更多（还有 {n} 条）',
             'action.close': '关闭',
             'action.restore': '恢复并继续对话',
             'action.hideInjected': '隐藏注入上下文',
@@ -637,8 +659,9 @@ window.__ModuleLoader__.load({
           en: {
             'panel.title': 'Archived session viewer',
             'footer.label': 'Archived sessions',
-            'panel.count': '{n} archived',
+            'panel.count': '{shown} of {n} listed',
             'action.refresh': 'Refresh',
+            'action.loadMore': 'Load more ({n} left)',
             'action.close': 'Close',
             'action.restore': 'Restore and continue',
             'action.hideInjected': 'Hide injected context',
@@ -712,6 +735,8 @@ window.__ModuleLoader__.load({
     };
   }
 });
+
+
 
 
 
