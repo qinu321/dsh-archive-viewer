@@ -171,9 +171,17 @@ check('the entry renders a dialog element', wideElements.some(element => element
 const styleElement = wideElements.find(element => element.type === 'style');
 const styleText = String(styleElement?.props?.children ?? '');
 check('the entry injects its own stylesheet', styleText.includes('.aav-footerBtn') && styleText.length > 500, String(styleText.length));
-check('the footer button pins its own 36px square', /\.aav-footerBtn\s*\{[^}]*width:\s*36px[^}]*height:\s*36px/.test(styleText), 'no 36px square rule');
-check('the footer button cannot be squeezed or stretched', /\.aav-footerBtn\s*\{[^}]*min-width:\s*36px[^}]*max-width:\s*36px/.test(styleText), 'no min/max-width clamp');
-check('both sidebar states keep the same square', /\.aav-footerBtnRail,\s*\.aav-footerBtnWide\s*\{[^}]*width:\s*36px/.test(styleText), 'no shared rail/wide rule');
+check('the footer button pins its own 40px square', /\.aav-footerBtn\s*\{[^}]*width:\s*40px[^}]*height:\s*40px/.test(styleText), 'no 40px square rule');
+check('the footer button cannot be squeezed or stretched', /\.aav-footerBtn\s*\{[^}]*min-width:\s*40px[^}]*max-width:\s*40px/.test(styleText), 'no min/max-width clamp');
+check('both sidebar states keep the same square', /\.aav-footerBtnRail,\s*\.aav-footerBtnWide\s*\{[^}]*width:\s*40px/.test(styleText), 'no shared rail/wide rule');
+check('the glyph colour follows the host tertiary label token with a fallback',
+  /\.aav-footerBtn\s*\{[^}]*color:\s*var\(--dsw-alias-label-tertiary,\s*var\(--dsw-alias-label-secondary,\s*currentColor\)\)/.test(styleText),
+  'tertiary token or its fallback is missing');
+check('the glyph is drawn at 20px', (() => {
+  // Read the size off the rendered icon element, not the source constant.
+  const icons = wideElements.filter(element => element.type !== 'button' && element.props !== undefined && element.props.viewBox === '0 0 24 24');
+  return icons.some(icon => icon.props.width === 20 && icon.props.height === 20);
+})(), JSON.stringify(wideElements.filter(element => element.props?.viewBox === '0 0 24 24').map(element => element.props?.width)));
 check('the button geometry is box-sizing-safe', /\.aav-footerBtn\s*\{[^}]*box-sizing:\s*border-box/.test(styleText), 'no border-box rule');
 
 let railError;
@@ -215,4 +223,5 @@ check('diagnostics post to the plugin own route', posted.every(entry => entry.ur
 console.log(results.join("\n"));
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${results.length - failures}/${results.length} checks`);
 process.exit(failures === 0 ? 0 : 1);
+
 

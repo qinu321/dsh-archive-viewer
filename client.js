@@ -182,15 +182,19 @@ window.__ModuleLoader__.load({
    and the row itself overflows whenever any entry asks for more width. */
 .aav-footerBtn { display: inline-flex; box-sizing: border-box; align-items: center; justify-content: center;
   /* A stacking escape hatch: measured on this machine the footer row is
-     264px + 33px + 36px wide inside a 280px column, so the last entry can be
+     264px + 33px + 40px wide inside a 280px column, so the last entry can be
      painted under a sibling or clipped. Raising the z-index keeps this entry
      clickable without changing the row's layout. */
   position: relative; z-index: 5;
-  width: 36px; min-width: 36px; max-width: 36px; height: 36px; padding: 0; margin: 0;
+  width: 40px; min-width: 40px; max-width: 40px; height: 40px; padding: 0; margin: 0;
   font: inherit; font-size: 13px; line-height: 1; white-space: nowrap; overflow: hidden;
-  color: var(--dsw-alias-label-primary); background: transparent; border: none; border-radius: 8px; cursor: pointer; }
-.aav-footerBtn:hover { background: var(--dsw-alias-bg-layer-2); }
-.aav-footerBtnRail, .aav-footerBtnWide { width: 36px; min-width: 36px; max-width: 36px; height: 36px; padding: 0; }
+  /* Tertiary label colour matches the quieter glyphs of the shipped foot
+     controls; the fallback keeps the icon visible if a future theme renames
+     the token instead of silently inheriting an invisible colour. */
+  color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary, currentColor)); background: transparent;
+  border: none; border-radius: 8px; cursor: pointer; }
+.aav-footerBtn:hover { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
+.aav-footerBtnRail, .aav-footerBtnWide { width: 40px; min-width: 40px; max-width: 40px; height: 40px; padding: 0; }
 `;
 
     /** Icon: an archive box with a magnifier — "read the archive". */
@@ -409,7 +413,7 @@ window.__ModuleLoader__.load({
             store.set({ open: true });
             if (store.state.listPhase !== 'loading') loadSessions();
           }
-        }, h(Icon, { size: wide ? 15 : 18 })),
+        }, h(Icon, { size: 20 })),
         h(Dialog, { t, onRestore: props.onRestore }));
     }
 
@@ -512,7 +516,7 @@ window.__ModuleLoader__.load({
               store.set({ open: true });
               if (store.state.listPhase !== 'loading') loadSessions();
             }
-          }, h(Icon, { size: wide ? 15 : 18 })));
+          }, h(Icon, { size: 20 })));
       }
     }
 
@@ -629,5 +633,7 @@ window.__ModuleLoader__.load({
     };
   }
 });
+
+
 
 
