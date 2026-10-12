@@ -133,13 +133,13 @@ const ownerProps = {
  */
 function collect(element, into = [], depth = 0) {
   if (element === null || element === undefined || typeof element === 'boolean') return into;
-  if (depth > 50) return into;
+  // Deep: the dialog > panel > flow nesting puts message rows past level 50.
+  if (depth > 200) return into;
   if (Array.isArray(element)) { for (const child of element) collect(child, into, depth + 1); return into; }
   if (typeof element !== 'object') return into;
   into.push(element);
   if (typeof element.type === 'function') {
-    const rendered = element.type(element.props ?? {});
-    collect(rendered, into, depth + 1);
+    const rendered = element.type(element.props ?? {});    collect(rendered, into, depth + 1);
     return into;
   }
   if (element.props !== undefined) collect(element.props.children, into, depth + 1);
@@ -200,6 +200,84 @@ check('the icon has a viewBox and a size', svg?.props?.viewBox === '0 0 24 24' &
 const shapes = collect(svg?.props?.children).filter(element => typeof element.type === 'string');
 check('the icon draws real shapes', shapes.length >= 4, String(shapes.length));
 
+// --- 5b. every transcript row renders -------------------------------------
+// The entry-only checks above could not see a crash inside a message row, and
+// a reference error there unmounts the whole page in the browser. This renders
+// the transcript flow through the dialog with one row of every kind present.
+function expandAll(element, depth = 0) {
+  // The guard is deliberately far above the real nesting depth (dialog > panel >
+  // flow > card): a too-small cap silently truncates the tree and turns the
+  // assertions below into no-ops, which is exactly how a crash escaped once.
+  if (element === null || element === undefined || typeof element === 'boolean' || depth > 200) return element;
+  if (Array.isArray(element)) return element.map(child => expandAll(child, depth + 1));
+  if (typeof element !== 'object') return element;
+  if (typeof element.type === 'function') return expandAll(element.type(element.props ?? {}), depth + 1);
+  if (element.props !== undefined) return { ...element, props: { ...element.props, children: expandAll(element.props.children, depth + 1) } };
+  return element;
+}
+
+// One row of every kind the fold can produce, including the branches that
+// crashed: a tool row whose tool name is known, one whose name is missing, and
+// one that is flagged unpaired.
+const transcriptItems = [
+  { kind: 'turn', seq: 1, time: 1, turn: 1, phase: 'start' },
+  { kind: 'title', seq: 2, time: 2, text: '会话标题' },
+  { kind: 'injected', seq: 3, time: 3, label: 'agent-instructions', text: '<system-reminder>rules</system-reminder>' },
+  { kind: 'user', seq: 4, time: 4, text: '手打的话', source: 'user' },
+  { kind: 'assistant', seq: 5, time: 5, text: '回答', reasoning: '想想', model: 'm', provider: 'p', usage: { input: 1, output: 2 } },
+  { kind: 'tool', seq: 6, time: 6, name: 'read', callId: 'c1', paired: true, args: '{\n  "file_path": "E:\\\\x"\n}', result: '文件内容' },
+  { kind: 'tool', seq: 7, time: 7, name: '', callId: 'c2', paired: false, args: '', result: '孤儿结果' },
+  { kind: 'tool', seq: 8, time: 8, name: '', paired: false, args: '', result: '', error: 'Boom' },
+  { kind: 'turn', seq: 9, time: 9, turn: 1, phase: 'end', reason: 'completed' }
+];
+// The external store is private to each factory instance: every `factory()`
+// call closes over its own. The rows below must render the SAME instance whose
+// state the harness drives, so this uses the second registration, not the first.
+const probeInstance = registered.get('dsh-archive-viewer')((spec) => {
+  if (seeded.has(spec)) return seeded.get(spec);
+  throw new Error(`require("${spec}") missed the module table`);
+});
+probeInstance.apply(ctx);
+const probeState = probeInstance.__state;
+const setProbeState = (patch) => probeInstance.__setState(patch);
+const probeRegistration = registrations[registrations.length - 1].callback();
+check('the factory exposes its store for the offline harness', probeState !== undefined, 'no __state export');
+// Must go through the store's own setter: `set()` publishes a NEW state object,
+// so mutating the getter's result would leave the rendered tree unaware.
+setProbeState({
+  open: true,
+  rowPhase: 'ready',
+  transcript: { sessionId: 'session-x', header: { id: 'session-x', version: 4, createdAt: 1, cwd: 'E:\\\\x' }, items: transcriptItems, rowCount: transcriptItems.length, eventCount: 9, injectedCount: 1, callCount: 2, usage: { input: 1, output: 2, calls: 1 } }
+});
+check('the harness state actually reached the store', probeInstance.__state.open === true && probeInstance.__state.transcript !== null,
+  JSON.stringify({ open: probeInstance.__state.open, hasTranscript: probeInstance.__state.transcript !== null }));
+
+let flowError;
+let flowTree;
+try {
+  flowTree = expandAll(probeRegistration.component(ownerProps));
+} catch (error) { flowError = error; }
+check('the transcript flow renders without throwing', flowError === undefined,
+  flowError === undefined ? undefined : `${String(flowError.message)} @ ${String(flowError.stack).split('\n')[1]?.trim()}`);
+const flowElements = collect(flowTree);
+// Visible evidence when the assertions below fail: what the collector saw.
+check('the collector reached deep content', flowElements.length > 60, `collected ${flowElements.length} elements; classes=${JSON.stringify([...new Set(flowElements.map(element => String(element.props?.className ?? '')).filter(Boolean))].slice(0, 12))}`);
+// Cards only: `aav-msgHead` / `aav-msgBody` also carry the "aav-msg" prefix.
+const cardCount = flowElements.filter(element => String(element.props?.className ?? '').split(' ')[0] === 'aav-msg').length;
+check('every transcript row produced a card', cardCount === 5, String(cardCount));
+check('the tool row shows its tool name', flowElements.some(element => String(element.props?.className ?? '') === 'aav-toolName' && element.props.children === 'read'));
+check('an unnamed tool row says so instead of inventing a name', flowElements.some(element => String(element.props?.className ?? '') === 'aav-toolName' && element.props.children === '(未记录工具名)'));
+check('an unpaired result is badged', flowElements.some(element => String(element.props?.className ?? '') === 'aav-badge' && element.props.children === '仅结果'));
+check('the tool arguments are rendered when present', flowElements.some(element => element.type === 'pre' && String(element.props?.children ?? '').includes('file_path')));
+check('the assistant reasoning is folded into details', flowElements.some(element => element.type === 'details'));
+check('the injected toggle is offered', flowElements.some(element => element.type === 'button' && String(element.props?.['aria-pressed']) === 'true'));
+// Hidden-by-default must actually hide: the injected card may not be present.
+check('injected rows are hidden by default', !flowElements.some(element => String(element.props?.className ?? '').includes('aav-injected')));
+setProbeState({ hideInjected: false });
+const shownElements = collect(expandAll(probeRegistration.component(ownerProps)));
+check('flipping the toggle brings injected rows back', shownElements.some(element => String(element.props?.className ?? '').includes('aav-injected')));
+setProbeState({ hideInjected: true, open: false, rowPhase: 'idle', transcript: null });
+
 // --- 6. diagnostics channel ----------------------------------------------
 const posted = [];
 globalThis.fetch = async (url, options) => {
@@ -223,5 +301,10 @@ check('diagnostics post to the plugin own route', posted.every(entry => entry.ur
 console.log(results.join("\n"));
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${results.length - failures}/${results.length} checks`);
 process.exit(failures === 0 ? 0 : 1);
+
+
+
+
+
 
 

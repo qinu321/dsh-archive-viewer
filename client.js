@@ -301,7 +301,7 @@ window.__ModuleLoader__.load({
         }
       }
       if (body.length === 0) body.push(h('div', { key: 'empty', className: 'aav-msgBody' }, t('empty.block')));
-      return h('div', { className }, h('div', { className: 'aav-msgHead' }, head.filter(Boolean).join(' · ')), body);
+      return h('div', { className }, header, body);
     }
 
     function Transcript(props) {
@@ -580,6 +580,15 @@ window.__ModuleLoader__.load({
 
     return {
       inject: ['slots', 'locale', 'uiWorkspace'],
+      /**
+       * Testability seam: the offline harness (client-selftest.mjs) drives this
+       * state directly to render the transcript without a browser. A getter, so
+       * it always reflects the live store object, and a setter that goes through
+       * the real store so subscribers (the rendered tree) update. Nothing in the
+       * plugin or the Host reads either.
+       */
+      get __state() { return store.state; },
+      __setState(patch) { store.set(patch); },
       apply(ctx) {
         const dictionaries = {
           zh: {
