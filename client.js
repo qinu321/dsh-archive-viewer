@@ -132,9 +132,13 @@ window.__ModuleLoader__.load({
       try {
         // A manual refresh drops the Host's title/scan caches; ordinary opens
         // reuse them so the list paints without re-inflating any session log.
-        const limit = options.limit ?? store.state.listLimit;
+        // Never let the page size fall back to undefined: an unset limit used
+        // to be indistinguishable from 'no request happened at all'.
+        const current = Number.isSafeInteger(store.state.listLimit) && store.state.listLimit > 0 ? store.state.listLimit : 50;
+        const limit = Number.isSafeInteger(options.limit) && options.limit > 0 ? options.limit : current;
         const query = `/sessions?limit=`;
         const result = await api(query);
+        report('list:fetched', JSON.stringify({ limit, url: query, returned: (result.sessions || []).length, total: result.total ?? result.archivedCount, hasMore: result.hasMore === true, titleSources: [...new Set((result.sessions || []).map(session => session.titleSource))] }));
         store.set({
           sessions: result.sessions || [],
           listTotal: result.total ?? result.archivedCount ?? (result.sessions || []).length,
@@ -142,6 +146,7 @@ window.__ModuleLoader__.load({
           listPhase: 'ready'
         });
       } catch (error) {
+        report('list:failed', String(error && error.message));
         store.set({ listPhase: 'error', listError: error.message });
       }
     }
@@ -405,7 +410,9 @@ window.__ModuleLoader__.load({
             type: 'button',
             className: 'aav-row aav-loadMore',
             onClick: () => loadSessions({ limit: store.state.listLimit + 50 })
-          }, t('action.loadMore', { n: state.listTotal - state.sessions.length }))
+          }, state.listPhase === 'loading'
+            ? t('action.loadingMore')
+            : t('action.loadMore', { n: Math.max(0, state.listTotal - state.sessions.length) }))
         : null;
 
       const rows = filtered.map(session => {
@@ -620,6 +627,7 @@ window.__ModuleLoader__.load({
             'panel.count': '已列出 {shown} / 共 {n} 条',
             'action.refresh': '刷新',
             'action.loadMore': '加载更多（还有 {n} 条）',
+            'action.loadingMore': '正在加载…',
             'action.close': '关闭',
             'action.restore': '恢复并继续对话',
             'action.hideInjected': '隐藏注入上下文',
@@ -662,6 +670,7 @@ window.__ModuleLoader__.load({
             'panel.count': '{shown} of {n} listed',
             'action.refresh': 'Refresh',
             'action.loadMore': 'Load more ({n} left)',
+            'action.loadingMore': 'Loading…',
             'action.close': 'Close',
             'action.restore': 'Restore and continue',
             'action.hideInjected': 'Hide injected context',
@@ -735,6 +744,8 @@ window.__ModuleLoader__.load({
     };
   }
 });
+
+
 
 
 
