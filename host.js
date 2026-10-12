@@ -215,9 +215,53 @@ export function formatToolArgs(raw) {
   catch { return raw; }
 }
 
+/**
+ * Tool-call metadata keyed by callId, collected from the complete raw log.
+ *
+ * Why a separate pass: the "current surface" view DSH exposes for a session
+ * carries tool RESULTS but not the `tool/call` events that name the tool — an
+ * archived read showed 91 results and zero calls. Without this map every
+ * result renders as "unpaired", which is exactly how the first version read.
+ * @param events - complete event log, calls included.
+ * @returns callId → { name, arguments }.
+ */
+export function collectCallMeta(events) {
+  const meta = new Map();
+  for (const event of events) {
+    if (event.type !== "tool/call") continue;
+    const callId = event.data?.callId ?? event.data?.id;
+    if (typeof callId !== "string") continue;
+    meta.set(callId, {
+      name: typeof event.data?.name === "string" ? event.data.name : "",
+      arguments: typeof event.data?.arguments === "string" ? event.data.arguments : ""
+    });
+  }
+  for (const event of events) {
+    if (event.type !== "assistant/message") continue;
+    for (const block of event.data?.message?.content ?? []) {
+      if (block?.type !== "tool-call" || typeof block.id !== "string") continue;
+      if (!meta.has(block.id)) meta.set(block.id, { name: block.name ?? "", arguments: block.arguments ?? "" });
+    }
+  }
+  return meta;
+}
+
+/** Whether one rendered row is Harness-injected context rather than something
+ * the user typed or the model said. Drives the reader's hide-injected toggle. */
+export function isInjectedRow(row) {
+  return row.kind === "injected";
+}
+
 /** Turn a raw event log into display rows: the conversation as it stood, with
- * tool calls paired to their results and injected context summarized. */
-export function buildRows(events, header) {
+ * tool calls paired to their results and injected context summarized.
+ * @param events - the events to render (the current surface, or the raw log).
+ * @param header - durable session header.
+ * @param options - `callsById` supplies tool-call metadata from the complete
+ *   log, so results render with their tool's name even when the view omits the
+ *   call events themselves.
+ */
+export function buildRows(events, header, options = {}) {
+  const callsById = options.callsById ?? collectCallMeta(events);
   const consumed = new Set();
   const rows = [];
   const resultsById = new Map();
@@ -248,9 +292,10 @@ export function buildRows(events, header) {
         const kind = data.source?.kind;
         const text = contentText(data.content);
         // Harness-injected context (runtime snapshot, workspace instructions,
-        // skill catalog, hook notices) also arrives as a user message. Keep it
-        // visible — the model read it — but label it so real typed prompts stay
-        // distinguishable in a long transcript.
+        // skill catalog, hook notices) also arrives as a user message. Label it
+        // so it can be collapsed away from the actual conversation: measured on
+        // a real archived session it was 216,688 characters against 3,621
+        // characters of typed prompts.
         const injected = kind === "system-prompt" || kind === "user-approval" || kind === "delegation"
           || text.startsWith("<system-reminder>")
           || text.startsWith("Current runtime context.");
@@ -297,13 +342,17 @@ export function buildRows(events, header) {
       }
       case "tool/result": {
         if (consumed.has(event.seq)) break;
+        const callId = data.message?.source?.callId ?? data.toolCallId;
+        const meta = typeof callId === "string" ? callsById.get(callId) : undefined;
         rows.push({
           ...base,
           kind: "tool",
-          name: "(未配对的工具结果)",
-          args: "",
+          name: meta?.name ?? "",
+          callId: typeof callId === "string" ? callId : undefined,
+          paired: meta !== undefined,
+          args: clip(formatToolArgs(meta?.arguments), 4000),
           result: clip(contentText(data.message?.content), MAX_BLOCK_CHARS),
-          error: data.error === undefined ? undefined : `${data.error.name ?? "error"}`
+          error: data.error === undefined ? undefined : `${data.error.name ?? "error"}${data.error.code ? ` (${data.error.code})` : ""}`
         });
         break;
       }
@@ -402,7 +451,11 @@ export async function transcriptFor(sessionQuery, sessionId) {
       }
     } catch { /* surface read is an optimization; the raw log stands in */ }
   }
-  const built = buildRows(surfaceEvents, snapshot?.session);
+  // The surface view omits `tool/call` events, so tool metadata is collected
+  // from the complete log and merged in while folding the surface rows.
+  const callsById = collectCallMeta(events);
+  const built = buildRows(surfaceEvents, snapshot?.session, { callsById });
+  const injectedCount = built.items.reduce((total, row) => total + (isInjectedRow(row) ? 1 : 0), 0);
   const usage = events.reduce((total, event) => {
     const value = event.data?.usage;
     if (value === undefined || value === null) return total;
@@ -419,6 +472,8 @@ export async function transcriptFor(sessionQuery, sessionId) {
     truncated: built.truncated,
     rowCount: built.rowCount,
     eventCount: built.eventCount,
+    injectedCount,
+    callCount: callsById.size,
     surfaceAvailable,
     firstSeq: built.firstSeq,
     lastSeq: built.lastSeq,

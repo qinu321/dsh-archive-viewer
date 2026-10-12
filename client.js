@@ -18,6 +18,21 @@ window.__ModuleLoader__.load({
 
     const API = '/archive-viewer/api';
     const NS = 'archive-viewer';
+    /** Injected context is hidden by default: measured on one archived session
+     * it was 216,688 characters of runtime snapshot / instructions / skill
+     * catalog against 3,621 characters of typed prompts. */
+    const HIDE_INJECTED_KEY = 'dsh-archive-viewer:hide-injected';
+    const readHideInjected = () => {
+      try { return window.localStorage.getItem(HIDE_INJECTED_KEY) !== '0'; }
+      catch { return true; }
+    };
+
+    /** Flip the injected-context preference and remember it across reloads. */
+    function toggleHideInjected() {
+      const next = !store.state.hideInjected;
+      try { window.localStorage.setItem(HIDE_INJECTED_KEY, next ? '1' : '0'); } catch { /* preference only */ }
+      store.set({ hideInjected: next });
+    }
 
     /**
      * Fire-and-forget page-side diagnostics. The Host keeps the last report in
@@ -54,7 +69,9 @@ window.__ModuleLoader__.load({
         rowPhase: 'idle',
         rowError: '',
         notice: '',
-        workspaces: {}
+        workspaces: {},
+        // Defaults to hiding injected context; the stored preference wins.
+        hideInjected: true
       },
       listeners: new Set(),
       set(patch) {
@@ -67,6 +84,7 @@ window.__ModuleLoader__.load({
       },
       snapshot() { return store.state; }
     };
+    store.state.hideInjected = readHideInjected();
 
     function useStore() {
       return useSyncExternalStore(store.subscribe, store.snapshot, store.snapshot);
@@ -167,6 +185,12 @@ window.__ModuleLoader__.load({
 .aav-user { border-color: var(--dsw-alias-border-l2); }
 .aav-user .aav-msgHead { color: var(--dsw-alias-label-primary); }
 .aav-tool .aav-msgBody { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+/* The tool name is the one thing a tool row must show: badge it so a scan of
+   the transcript answers "which tool ran" without expanding anything. */
+.aav-toolName { padding: 1px 7px; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11.5px; color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-layer-2); }
+.aav-badge { padding: 1px 6px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 999px; font-size: 10.5px;
+  color: var(--dsw-alias-label-secondary); }
 .aav-injected { opacity: .72; }
 .aav-turn { margin: 16px 0 10px; font-size: 11px; color: var(--dsw-alias-label-secondary); }
 .aav-pre { margin: 0; padding: 8px 10px; background: var(--dsw-alias-bg-base); border-top: 1px solid var(--dsw-alias-border-l1);
@@ -224,15 +248,30 @@ window.__ModuleLoader__.load({
       if (item.kind === 'title') {
         return h('div', { className: 'aav-turn' }, t('title.row', { title: item.text }));
       }
-      const head = [];
-      if (item.kind === 'user') head.push(t('role.user'));
-      else if (item.kind === 'assistant') head.push(t('role.assistant'));
-      else if (item.kind === 'tool') head.push(t('role.tool', { name: item.name || '' }));
-      else head.push(item.label || item.kind);
-      if (item.time) head.push(formatTime(item.time));
-      if (item.model) head.push(item.model);
-      if (item.interrupted) head.push(t('badge.interrupted'));
-      if (item.error) head.push(item.error);
+      // The header carries the tool name as its own badge: the whole point of
+      // a tool row is knowing WHICH tool ran, so it must not be buried in a
+      // joined metadata string.
+      const metaParts = [];
+      if (item.time) metaParts.push(formatTime(item.time));
+      if (item.model) metaParts.push(item.model);
+      if (item.interrupted) metaParts.push(t('badge.interrupted'));
+      if (item.error) metaParts.push(item.error);
+
+      let header;
+      if (item.kind === 'tool') {
+        const badges = [];
+        if (item.name && item.name !== '') badges.push(h('span', { key: 'name', className: 'aav-toolName' }, item.name));
+        else badges.push(h('span', { key: 'name', className: 'aav-toolName' }, t('tool.unknown')));
+        if (item.paired === false) badges.push(h('span', { key: 'state', className: 'aav-badge' }, t('tool.resultOnly')));
+        header = h('div', { className: 'aav-msgHead' }, badges, metaParts.join(' · '));
+      } else {
+        const head = [];
+        if (item.kind === 'user') head.push(t('role.user'));
+        else if (item.kind === 'assistant') head.push(t('role.assistant'));
+        else head.push(item.label || item.kind);
+        head.push(...metaParts);
+        header = h('div', { className: 'aav-msgHead' }, head.filter(Boolean).join(' · '));
+      }
 
       const className = 'aav-msg' + (item.kind === 'user' ? ' aav-user' : '')
         + (item.kind === 'tool' ? ' aav-tool' : '')
@@ -289,20 +328,33 @@ window.__ModuleLoader__.load({
       const notices = [];
       if (transcript.truncated) notices.push(h('div', { key: 'truncated', className: 'aav-banner' }, t('notice.truncated', { n: transcript.rowCount })));
       if (transcript.surfaceAvailable === false) notices.push(h('div', { key: 'raw', className: 'aav-banner' }, t('notice.raw')));
+      const all = transcript.items || [];
+      const injectedRows = all.filter(item => item.kind === 'injected').length;
+      const items = state.hideInjected ? all.filter(item => item.kind !== 'injected') : all;
+      if (state.hideInjected && injectedRows > 0) {
+        notices.push(h('div', { key: 'injected', className: 'aav-banner' }, t('notice.injectedHidden', { n: injectedRows })));
+      }
       const restoreButton = h('button', {
         type: 'button',
         className: 'aav-btn aav-btnPrimary',
         onClick: () => onRestore(transcript.sessionId, t)
       }, t('action.restore'));
+      const injectedToggle = h('button', {
+        type: 'button',
+        className: 'aav-btn',
+        'aria-pressed': state.hideInjected,
+        onClick: () => toggleHideInjected()
+      }, state.hideInjected ? t('action.showInjected', { n: injectedRows }) : t('action.hideInjected'));
       const banner = h('div', { className: 'aav-banner' },
         h('span', { className: 'aav-tag' }, t('badge.readonly')),
         h('span', null, t('banner.readonly')),
         state.notice ? h('span', null, state.notice) : null,
         h('span', { className: 'aav-spacer' }),
+        injectedToggle,
         restoreButton);
       const flow = h('div', { className: 'aav-flow' },
         notices,
-        (transcript.items || []).map(item => h(MessageCard, { key: `${item.kind}:${item.seq}`, item, t })));
+        items.map(item => h(MessageCard, { key: `${item.kind}:${item.seq}`, item, t })));
       return h(React.Fragment, null, head, banner, flow);
     }
 
@@ -537,6 +589,8 @@ window.__ModuleLoader__.load({
             'action.refresh': '刷新',
             'action.close': '关闭',
             'action.restore': '恢复并继续对话',
+            'action.hideInjected': '隐藏注入上下文',
+            'action.showInjected': '显示注入上下文（{n}）',
             'search.placeholder': '搜索标题 / ID / 备注',
             'loading.list': '正在读取归档列表…',
             'loading.transcript': '正在读取会话正文…',
@@ -550,9 +604,12 @@ window.__ModuleLoader__.load({
             'banner.readonly': '归档状态未被改动，此视图不写入任何会话状态。',
             'notice.truncated': '仅显示最近 {n} 条记录，更早的内容未在此视图加载。',
             'notice.raw': '未能读取当前会话面，以下为原始日志视图。',
+            'notice.injectedHidden': '已隐藏 {n} 条注入上下文（系统提示、运行时快照、技能目录等）。',
             'role.user': '用户',
             'role.assistant': '助手',
             'role.tool': '工具 · {name}',
+            'tool.unknown': '(未记录工具名)',
+            'tool.resultOnly': '仅结果',
             'reasoning.show': '思考过程',
             'tool.args': '参数',
             'tool.result': '结果',
@@ -573,6 +630,8 @@ window.__ModuleLoader__.load({
             'action.refresh': 'Refresh',
             'action.close': 'Close',
             'action.restore': 'Restore and continue',
+            'action.hideInjected': 'Hide injected context',
+            'action.showInjected': 'Show injected context ({n})',
             'search.placeholder': 'Search title / ID / notes',
             'loading.list': 'Reading the archive list…',
             'loading.transcript': 'Reading the session log…',
@@ -586,9 +645,12 @@ window.__ModuleLoader__.load({
             'banner.readonly': 'Archive state untouched; this view writes no session state.',
             'notice.truncated': 'Showing the {n} most recent rows; earlier content is not loaded here.',
             'notice.raw': 'The current session surface could not be read; showing the raw log.',
+            'notice.injectedHidden': 'Hid {n} injected-context rows (system prompt, runtime snapshot, skill catalog).',
             'role.user': 'User',
             'role.assistant': 'Assistant',
             'role.tool': 'Tool · {name}',
+            'tool.unknown': '(tool name not logged)',
+            'tool.resultOnly': 'result only',
             'reasoning.show': 'Reasoning',
             'tool.args': 'Arguments',
             'tool.result': 'Result',
@@ -639,6 +701,7 @@ window.__ModuleLoader__.load({
     };
   }
 });
+
 
 
 

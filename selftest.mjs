@@ -20,7 +20,9 @@ import {
   assistantParts,
   buildRows,
   configDshHome,
+  collectCallMeta,
   contentText,
+  isInjectedRow,
   formatToolArgs,
   resolveDshHome,
   safeErrorMessage
@@ -49,6 +51,43 @@ check("configDshHome passes a string through", configDshHome({ dshHome: "E:\\x" 
 check("configDshHome rejects a non-string", (() => { try { configDshHome({ dshHome: 5 }); return false; } catch { return true; } })());
 check("resolveDshHome honours an explicit path", resolveDshHome("E:\\DeepSeek Harness") === "E:\\DeepSeek Harness");
 check("resolveDshHome expands ~", resolveDshHome("~/dsh-test") === join(homedir(), "dsh-test"));
+
+// --- 2b. tool pairing across the surface view -----------------------------
+// The surface view DSH exposes carries tool RESULTS but not the `tool/call`
+// events that name the tool: a real archived read returned 91 results with no
+// calls, so every row rendered as "unpaired". Call metadata must therefore come
+// from the complete log.
+const fullLog = [
+  { type: "tool/call", seq: 10, time: 1, data: { turn: 1, step: 1, callId: "c1", name: "read", arguments: '{"file_path":"E:\\\\x"}' } },
+  { type: "tool/result", seq: 11, time: 2, data: { message: { role: "tool", source: { kind: "tool", callId: "c1" }, content: [{ type: "text", text: "file body" }] } } },
+  { type: "tool/call", seq: 12, time: 3, data: { turn: 1, step: 1, callId: "c2", name: "grep", arguments: '{"pattern":"x"}' } },
+  { type: "tool/result", seq: 13, time: 4, data: { message: { role: "tool", source: { kind: "tool", callId: "c2" }, content: [{ type: "text", text: "no match" }] } } }
+];
+const meta = collectCallMeta(fullLog);
+check("collectCallMeta indexes every call by callId", meta.size === 2 && meta.get("c1").name === "read" && meta.get("c2").name === "grep", JSON.stringify([...meta]));
+check("collectCallMeta keeps the raw argument string", meta.get("c1").arguments === '{"file_path":"E:\\\\x"}', String(meta.get("c1").arguments));
+
+const surfaceOnly = fullLog.filter(event => event.type === "tool/result");
+const pairedByMeta = buildRows(surfaceOnly, undefined, { callsById: meta });
+check("a surface with only results still names the tool", pairedByMeta.items.length === 2
+  && pairedByMeta.items[0].name === "read" && pairedByMeta.items[1].name === "grep",
+  JSON.stringify(pairedByMeta.items.map(row => row.name)));
+check("a matched result is not flagged as unpaired", pairedByMeta.items.every(row => row.paired === true), JSON.stringify(pairedByMeta.items.map(row => row.paired)));
+check("the call arguments come from the log, not the result", pairedByMeta.items[0].args.includes("file_path"), String(pairedByMeta.items[0].args));
+check("the tool result body is kept", pairedByMeta.items[0].result === "file body", String(pairedByMeta.items[0].result));
+
+const unknownCall = buildRows([{ type: "tool/result", seq: 5, time: 1, data: { message: { role: "tool", source: { kind: "tool", callId: "nope" }, content: [{ type: "text", text: "orphan" }] } } }], undefined, { callsById: meta });
+check("a result with no call anywhere is flagged unpaired", unknownCall.items[0].paired === false, JSON.stringify(unknownCall.items[0]));
+check("an unpaired result carries no invented tool name", unknownCall.items[0].name === "", JSON.stringify(unknownCall.items[0].name));
+
+check("isInjectedRow separates injected rows", (() => {
+  const rows = buildRows([
+    { type: "user/message", seq: 1, time: 1, data: { content: [{ type: "text", text: "<system-reminder>x</system-reminder>" }], source: { kind: "agent-instructions" } } },
+    { type: "user/message", seq: 2, time: 2, data: { content: [{ type: "text", text: "typed" }], source: { kind: "user" } } },
+    { type: "system/message", seq: 3, time: 3, data: { message: { content: [{ type: "text", text: "system prompt" }] } } }
+  ], undefined);
+  return rows.items.filter(isInjectedRow).length === 2 && rows.items.filter(row => !isInjectedRow(row)).length === 1;
+})());
 
 // --- 3. transcript fold ---------------------------------------------------
 const synthetic = [
@@ -268,4 +307,5 @@ if (process.env.ARCHIVE_VIEWER_LIVE === "1") {
 console.log(results.join("\n"));
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${results.length - failures}/${results.length} checks`);
 process.exit(failures === 0 ? 0 : 1);
+
 
