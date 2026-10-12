@@ -106,6 +106,73 @@ export function isExcludedWorkspace(cwd, excluded) {
   });
 }
 
+/**
+ * Comparison key for a workspace path: separators unified, trailing slashes
+ * dropped, Windows-style paths case-folded. A registry `path` and a session
+ * `cwd` that differ only in those ways must still be recognised as the same
+ * directory.
+ * @param value - a path as the registry or a session header reports it.
+ * @returns the comparison key, or "" when there is nothing to compare.
+ */
+export function workspacePathKey(value) {
+  if (typeof value !== "string" || value === "") return "";
+  const path = value.replace(/[\\/]+/g, "/").replace(/\/+$/, "") || "/";
+  return (/^[a-z]:(?:\/|$)/i.test(path) || path.startsWith("//")) ? path.toLowerCase() : path;
+}
+
+/**
+ * Index the workspace registry for session → workspace resolution.
+ *
+ * Two tiers, because a session can be tied to a workspace in two ways. The
+ * durable one is membership: the registry's own contract says an archived
+ * session keeps its `sessionIds` slot so unarchiving restores its position.
+ * The fallback is the path: older sessions carry only a `cwd`, which matches a
+ * registered workspace path.
+ *
+ * @param workspaces - registry entities (`id`, `title`, `path`, `sessionIds`).
+ * @returns `{ bySession, byPath, titles }` — the two lookup tiers and a
+ *   workspace-id → title map. All the work is in-memory: no I/O per session.
+ */
+export function indexWorkspaces(workspaces) {
+  const bySession = new Map();
+  const byPath = new Map();
+  const titles = new Map();
+  for (const workspace of workspaces ?? []) {
+    if (workspace === null || workspace === undefined) continue;
+    const id = String(workspace.id);
+    titles.set(id, workspace.title);
+    const key = workspacePathKey(workspace.path);
+    if (key !== "") {
+      if (!byPath.has(key)) byPath.set(key, new Set());
+      byPath.get(key).add(id);
+    }
+    for (const sessionId of Array.isArray(workspace.sessionIds) ? workspace.sessionIds : []) {
+      const member = String(sessionId);
+      if (!bySession.has(member)) bySession.set(member, new Set());
+      bySession.get(member).add(id);
+    }
+  }
+  return { bySession, byPath, titles };
+}
+
+/**
+ * The workspaces one session belongs to.
+ *
+ * Membership wins over the path: it is durable account data, while a `cwd` is
+ * whatever the session was last working in. The path tier only answers for
+ * sessions the registry never accounted (older logs).
+ *
+ * @param sessionId - the session to place.
+ * @param cwd - the session's associated directory, when known.
+ * @param index - the result of {@link indexWorkspaces}.
+ * @returns a Set of workspace ids; empty means "ungrouped".
+ */
+export function sessionWorkspaces(sessionId, cwd, index) {
+  const byMembership = index?.bySession?.get(String(sessionId));
+  if (byMembership !== undefined && byMembership.size > 0) return byMembership;
+  return index?.byPath?.get(workspacePathKey(cwd)) ?? new Set();
+}
+
 /** Durable artifact filenames, newest generation first. */
 const ARTIFACT_NAMES = [
   "session.v4.jsonl.zstd",
@@ -581,18 +648,20 @@ export async function transcriptFor(sessionQuery, sessionId) {
 
 /** Archive-list payload: registry membership, workspace title, folded title,
  * artifact statistics. Persistence-derived values are best-effort per id so
- * one unreadable session cannot fail the whole list. */
-export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRoot, artifactIndex, titleCache, projectionCache, projectionCacheDir, dshHome, page, excludedPaths, timings }) {
+ * one unreadable session cannot fail the whole list.
+ * @param options.workspaceFilter - "" for every archived session, a workspace
+ *   id for that workspace only, or "ungrouped" for sessions no workspace
+ *   accounts for. Applied to the whole archive set, before paging. */
+export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRoot, artifactIndex, titleCache, projectionCache, projectionCacheDir, dshHome, page, excludedPaths, workspaceFilter, timings }) {
   const mark = () => Date.now();
   const spent = {};
   const started = mark();
   const archivedIds = [...(workspaceRegistry?.archivedSessionIds ?? [])].map(String);
-  const workspaceBySession = new Map();
-  const workspaceTitles = new Map();
-  for (const workspace of workspaceRegistry?.list?.() ?? []) {
-    workspaceTitles.set(String(workspace.id), workspace.title);
-    for (const id of workspace.sessionIds ?? []) workspaceBySession.set(String(id), String(workspace.id));
-  }
+  const workspaceIndex = indexWorkspaces(workspaceRegistry?.list?.() ?? []);
+  const titleOf = (id) => {
+    const title = workspaceIndex.titles.get(id);
+    return typeof title === "string" && title.trim() !== "" ? title : id;
+  };
   spent.registryMs = mark() - started;
 
   const records = new Map();
@@ -611,6 +680,22 @@ export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRo
   spent.filterFirstFields = filterFirstFields;
   if (filterError !== undefined) spent.filterError = filterError;
 
+  // The artifact index answers two questions below — the exclusion decision and
+  // the `cwd` behind the workspace resolution — so it is resolved once, here.
+  const scanFrom = mark();
+  const index = artifactIndex ?? await scanSessionArtifacts(sessionsRoot);
+  spent.scanMs = mark() - scanFrom;
+
+  /** The directory a session is associated with: its header when a persistence
+   * record exists, else the artifact's project directory. */
+  const cwdOf = (id) => records.get(id)?.header?.cwd ?? index.get(id)?.project;
+  /** Resolved once per session; the resolution itself is pure in-memory work. */
+  const ownersById = new Map();
+  const workspacesOf = (id) => {
+    if (!ownersById.has(id)) ownersById.set(id, sessionWorkspaces(id, cwdOf(id), workspaceIndex));
+    return ownersById.get(id);
+  };
+
   // Internal machinery stays out of the archive list: the memory plugin's
   // workbench sessions archive and delete themselves, so they are noise here
   // and their leftover ids are the stale entries that cost a fold each request.
@@ -618,23 +703,44 @@ export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRo
   // directory), so nothing extra is read to decide.
   const hiddenByPath = [];
   const visibleIds = archivedIds.filter(id => {
-    const cwd = records.get(id)?.header?.cwd ?? artifactIndex?.get(id)?.project;
-    if (!isExcludedWorkspace(cwd, excludedPaths)) return true;
+    if (!isExcludedWorkspace(cwdOf(id), excludedPaths)) return true;
     hiddenByPath.push(id);
     return false;
   });
   spent.hiddenByPath = hiddenByPath.length;
   spent.hiddenSample = hiddenByPath.slice(0, 3);
 
-  const from = mark();
-  const index = artifactIndex ?? await scanSessionArtifacts(sessionsRoot);
-  spent.scanMs = mark() - from;
+  // The workspace filter is applied to the whole visible set, before paging:
+  // the page, its totals and `hasMore` must all describe the filtered set. A
+  // filter applied in the reader over the loaded page would silently
+  // under-report any workspace holding more sessions than one page.
+  const wanted = typeof workspaceFilter === "string" ? workspaceFilter.trim() : "";
+  const matchedIds = wanted === "" ? visibleIds : visibleIds.filter(id => {
+    const owners = workspacesOf(id);
+    return wanted === "ungrouped" ? owners.size === 0 : owners.has(wanted);
+  });
+  spent.workspaceMatched = matchedIds.length;
+
+  // Counts for the reader's workspace selector. They describe the visible set,
+  // NOT the filtered one, so picking a workspace cannot make the other options
+  // disappear. A session registered under several workspaces counts once per
+  // workspace; "ungrouped" means no workspace at all.
+  const workspaceCounts = new Map();
+  let ungroupedCount = 0;
+  for (const id of visibleIds) {
+    const owners = workspacesOf(id);
+    if (owners.size === 0) { ungroupedCount += 1; continue; }
+    for (const owner of owners) workspaceCounts.set(owner, (workspaceCounts.get(owner) ?? 0) + 1);
+  }
+  const workspaceOptions = [...workspaceCounts.entries()]
+    .map(([id, count]) => ({ id, title: titleOf(id), count }))
+    .sort((a, b) => a.title.localeCompare(b.title));
 
   // One page only: every per-session cost below (titles, folding) is bounded by
   // the page size, so latency stays flat while the archive grows. `hasMore`
   // tells the reader there is another page.
   const pageSize = Number.isSafeInteger(page) && page > 0 ? Math.min(page, MAX_LIST_LIMIT) : DEFAULT_LIST_LIMIT;
-  const pageIds = visibleIds.slice(0, pageSize);
+  const pageIds = matchedIds.slice(0, pageSize);
 
   // Titles, cheapest source first. Measured here: reading all 52 persisted
   // checkpoints costs ~14ms, while folding one title out of a log costs ~44ms
@@ -732,12 +838,15 @@ export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRo
   const sessions = pageIds.map(id => {
     const record = records.get(id);
     const artifact = index.get(id);
-    const workspaceId = workspaceBySession.get(id);
+    // The row shows the workspace the filter matched it by, so a session placed
+    // via its `cwd` is not listed as if it belonged nowhere.
+    const owners = workspacesOf(id);
+    const workspaceId = owners.size > 0 ? [...owners][0] : undefined;
     return {
       id,
       title: titles.get(id) ?? "",
       workspaceId: workspaceId ?? "",
-      workspaceTitle: workspaceId === undefined ? "" : (workspaceTitles.get(workspaceId) ?? workspaceId),
+      workspaceTitle: workspaceId === undefined ? "" : titleOf(workspaceId),
       cwd: record?.header?.cwd ?? artifact?.project ?? "",
       createdAt: record?.header?.createdAt ?? undefined,
       agentPreset: record?.header?.agentPreset ?? undefined,
@@ -752,18 +861,26 @@ export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRo
   });
   sessions.sort((a, b) => (b.createdAt ?? b.mtime ?? 0) - (a.createdAt ?? a.mtime ?? 0));
   spent.totalMs = mark() - started;
-  spent.archived = visibleIds.length;
+  spent.archived = matchedIds.length;
   spent.archivedAll = archivedIds.length;
   if (timings !== undefined) Object.assign(timings, spent);
   return {
     sessions,
     // Both counts are reported, so the reader can say "N hidden" without
     // misreporting how many ids the archive set actually holds.
-    archivedCount: visibleIds.length,
-    total: visibleIds.length,
+    archivedCount: matchedIds.length,
+    total: matchedIds.length,
     hiddenCount: hiddenByPath.length,
     archivedIdCount: archivedIds.length,
-    hasMore: visibleIds.length > pageIds.length,
+    // The visible size with no workspace filter: the reader labels its "all
+    // workspaces" entry with it, which the filtered `total` cannot supply.
+    visibleTotal: visibleIds.length,
+    // The filter the Host actually applied, echoed so the reader can tell a
+    // filtered response from an unfiltered one.
+    workspace: wanted,
+    workspaceOptions,
+    ungroupedCount,
+    hasMore: matchedIds.length > pageIds.length,
     // Folded per page in newest-first order, so "load more" walks the archive
     // without ever resolving more titles than the page it is showing.
     timings: spent
@@ -815,6 +932,11 @@ export function apply(ctx, config = {}) {
           const force = url.searchParams.get("refresh") === "1";
           if (force) titleCache.clear();
           const rawLimit = Number(url.searchParams.get("limit") ?? "");
+          // `workspace=<id>` narrows the list to that workspace's archived
+          // sessions, `workspace=ungrouped` to the ones no workspace accounts
+          // for. Absent/empty means the whole archive. The value is only ever
+          // compared against registry ids, never composed into a path.
+          const workspaceFilter = (url.searchParams.get("workspace") ?? "").trim();
           const artifactIndex = await artifacts(force);
           const result = await listArchived({
             workspaceRegistry: ctx.workspaceRegistry,
@@ -827,6 +949,7 @@ export function apply(ctx, config = {}) {
             projectionCache: ctx.get("sessionProjectionCache"),
             projectionCacheDir: join(dshHome, ...PROJECTION_CACHE_SEGMENTS),
             excludedPaths,
+            workspaceFilter,
             page: Number.isSafeInteger(rawLimit) && rawLimit > 0 ? rawLimit : undefined
           });
           return sendJson(res, 200, { ok: true, result });

@@ -280,21 +280,26 @@ setProbeState({ hideInjected: true, open: false, rowPhase: 'idle', transcript: n
 
 // --- 5f. the list URL must carry the page size ----------------------------
 const listUrls = [];
+/** The panel's list fetch goes through this stub, so each assertion can swap
+ *  the payload (and read back the URL it asked for). */
+const defaultListResult = () => ({
+  sessions: new Array(50).fill(0).map((_, index) => ({ id: 's' + index, title: 't' + index, titleSource: 'checkpoint', bytes: 10, createdAt: index })),
+  total: 52,
+  archivedCount: 52,
+  visibleTotal: 52,
+  workspace: '',
+  workspaceOptions: [],
+  ungroupedCount: 0,
+  hasMore: true
+});
+let listResult = defaultListResult;
 globalThis.fetch = async (url) => {
   // Diagnostics posts ride the same fetch; the list assertions must ignore them.
   if (!String(url).includes('/diagnostic')) listUrls.push(String(url));
   return {
     status: 200,
     async json() {
-      return {
-        ok: true,
-        result: {
-          sessions: new Array(50).fill(0).map((_, index) => ({ id: 's' + index, title: 't' + index, titleSource: 'checkpoint', bytes: 10, createdAt: index })),
-          total: 52,
-          archivedCount: 52,
-          hasMore: true
-        }
-      };
+      return { ok: true, result: listResult(String(url)) };
     }
   };
 };
@@ -332,11 +337,116 @@ const refreshUrl = listUrls[beforeRefresh];
 const servedLimit = String(probeInstance.__state.listLimit);
 check('a forced refresh carries the served page size and the cache reset',
   refreshed && typeof refreshUrl === 'string' && refreshUrl === '/archive-viewer/api/sessions?limit=' + servedLimit + '&refresh=1', String(refreshUrl) + ' vs served ' + servedLimit);
-// The Host echoes the page it actually served; that becomes the next request
-// size so pressing more again cannot silently re-ask for the same page.
-check('the served page size becomes the next request size',
-  probeInstance.__state.listLimit === 50, String(probeInstance.__state.listLimit));
-setProbeState({ open: false, listHasMore: false });
+// A short answer must not shrink the window: the Host only answers short when
+// the set is exhausted (`hasMore` false), and a window shrunk to it would make
+// the next unfiltered request come back a handful of rows long.
+check('an answer shorter than the request does not shrink the window',
+  probeInstance.__state.listLimit === 100, String(probeInstance.__state.listLimit));
+
+// --- 5g. the workspace selector -------------------------------------------
+// The selector filters the archive on the Host side: the list route is asked
+// for one workspace, so a workspace holding more sessions than one page is
+// still reported in full — filtering the loaded page here would under-report.
+const workspaceOptions = [
+  { id: 'ws-debug', title: 'debug', count: 44 },
+  { id: 'ws-temp', title: 'temp', count: 2 }
+];
+const listForWorkspace = () => ({
+  sessions: [{ id: 'session-a', title: '归档的会话', titleSource: 'checkpoint', bytes: 10, createdAt: 5, workspaceId: 'ws-debug', workspaceTitle: 'debug' }],
+  total: 44,
+  archivedCount: 44,
+  visibleTotal: 46,
+  workspace: 'ws-debug',
+  workspaceOptions,
+  ungroupedCount: 0,
+  hasMore: false
+});
+listResult = listForWorkspace;
+setProbeState({
+  open: true, listPhase: 'ready', listLimit: 50, listTotal: 46, listHasMore: false, query: '',
+  sessions: [], workspaceFilter: '', workspaceOptions, ungroupedCount: 0, visibleTotal: 46, filterSupported: true
+});
+
+const panelElements = renderPanel();
+const selectIndex = panelElements.findIndex(element => element.type === 'select');
+const inputIndex = panelElements.findIndex(element => element.type === 'input');
+check('the panel renders a workspace selector', selectIndex !== -1, 'no select element');
+check('the selector sits above the search box', selectIndex !== -1 && inputIndex !== -1 && selectIndex < inputIndex,
+  `select@${selectIndex} input@${inputIndex}`);
+const optionLabels = panelElements.filter(element => element.type === 'option').map(element => element.props?.children);
+check('the "all workspaces" entry carries the visible archive size',
+  optionLabels.includes('全部工作区（46）'), JSON.stringify(optionLabels));
+check('every workspace holding archived sessions is offered with its count',
+  optionLabels.includes('debug（44）') && optionLabels.includes('temp（2）'), JSON.stringify(optionLabels));
+check('no ungrouped entry when every session is accounted for',
+  !optionLabels.some(label => String(label).startsWith('未分组')), JSON.stringify(optionLabels));
+
+const beforeSwitch = listUrls.length;
+const select = panelElements.find(element => element.type === 'select');
+await select.props.onChange({ target: { value: 'ws-debug' } });
+check('choosing a workspace asks the Host for that workspace',
+  listUrls[beforeSwitch] === '/archive-viewer/api/sessions?limit=50&workspace=ws-debug', String(listUrls[beforeSwitch]));
+check('the choice is kept in the store', probeInstance.__state.workspaceFilter === 'ws-debug', String(probeInstance.__state.workspaceFilter));
+check('the filtered page replaces the rows on screen',
+  probeInstance.__state.sessions.length === 1 && probeInstance.__state.sessions[0].id === 'session-a',
+  JSON.stringify(probeInstance.__state.sessions.map(session => session.id)));
+check('the filtered total is reported, the unfiltered size is kept for the label',
+  probeInstance.__state.listTotal === 44 && probeInstance.__state.visibleTotal === 46,
+  JSON.stringify([probeInstance.__state.listTotal, probeInstance.__state.visibleTotal]));
+
+listResult = defaultListResult;
+const beforeAll = listUrls.length;
+const selectAgain = renderPanel().find(element => element.type === 'select');
+await selectAgain.props.onChange({ target: { value: '' } });
+check('clearing the selector asks for the whole archive again',
+  listUrls[beforeAll] === '/archive-viewer/api/sessions?limit=50', String(listUrls[beforeAll]));
+check('the cleared choice is stored as "all"', probeInstance.__state.workspaceFilter === '', String(probeInstance.__state.workspaceFilter));
+
+// A workspace that loses its last archived session (restored elsewhere while
+// the panel is open) must not strand the list on an empty page: the selection
+// falls back to "all" once, without asking repeatedly.
+let staleUrls = 0;
+listResult = (url) => {
+  const asked = /workspace=([^&]+)/.exec(url);
+  return {
+    sessions: [], total: 0, archivedCount: 0, visibleTotal: 0, hasMore: false,
+    workspace: asked === null ? '' : decodeURIComponent(asked[1]),
+    workspaceOptions: [], ungroupedCount: 0
+  };
+};
+const beforeStale = listUrls.length;
+setProbeState({ workspaceFilter: 'ws-debug', filterSupported: true });
+await clickByText('刷新');
+staleUrls = listUrls.length - beforeStale;
+check('a workspace whose sessions are gone falls back to the whole archive',
+  listUrls[beforeStale] === '/archive-viewer/api/sessions?limit=50&workspace=ws-debug&refresh=1'
+  && listUrls[beforeStale + 1] === '/archive-viewer/api/sessions?limit=50&refresh=1',
+  JSON.stringify(listUrls.slice(beforeStale)));
+check('the fallback is asked for once, not in a loop', staleUrls === 2, String(staleUrls));
+check('the store drops the stale choice', probeInstance.__state.workspaceFilter === '', String(probeInstance.__state.workspaceFilter));
+
+// An older Host neither understands `workspace=` nor echoes it. Showing the
+// selector then would advertise a filter that is not in force, so the panel
+// says what is missing instead.
+listResult = () => ({ sessions: [], total: 0, archivedCount: 0, hasMore: false });
+await clickByText('刷新');
+check('a Host without the filter is reported as such', probeInstance.__state.filterSupported === false, String(probeInstance.__state.filterSupported));
+const noticeElements = renderPanel();
+check('the selector is replaced by a restart notice',
+  !noticeElements.some(element => element.type === 'select')
+  && noticeElements.some(element => String(element.props?.className ?? '') === 'aav-fieldNote'
+    && String(element.props?.children ?? '').includes('重启')),
+  JSON.stringify(noticeElements.filter(element => String(element.props?.className ?? '') === 'aav-fieldNote').map(element => element.props.children)));
+
+// The empty state has to name what is actually empty: a chosen workspace with
+// no archived session is not the same as an empty archive.
+setProbeState({ filterSupported: true, workspaceFilter: 'ws-gone', listTotal: 0, listPhase: 'ready', sessions: [], query: '' });
+const emptyElements = renderPanel();
+check('an empty workspace says so instead of claiming the archive is empty',
+  emptyElements.some(element => String(element.props?.className ?? '') === 'aav-empty'
+    && element.props?.children === '该工作区没有已归档的会话'),
+  JSON.stringify(emptyElements.filter(element => String(element.props?.className ?? '') === 'aav-empty').map(element => element.props.children)));
+setProbeState({ open: false, listHasMore: false, workspaceFilter: '', sessions: [], listTotal: 0, query: '' });
 
 // --- 6. diagnostics channel ----------------------------------------------
 const posted = [];

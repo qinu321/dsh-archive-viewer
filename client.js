@@ -69,6 +69,20 @@ window.__ModuleLoader__.load({
         listPhase: 'idle',
         listError: '',
         query: '',
+        // '' = every workspace; a workspace id; or 'ungrouped'. The filter is
+        // applied by the Host over the whole archive, never over the loaded
+        // page, so it cannot under-report a workspace bigger than one page.
+        workspaceFilter: '',
+        // Options and counts come from the list payload: the Host already has
+        // the registry and the headers in hand, so the reader never derives
+        // them from a page it only partially holds.
+        workspaceOptions: [],
+        ungroupedCount: 0,
+        // Visible archive size with no workspace filter ("all workspaces").
+        visibleTotal: 0,
+        // null until the first list response says whether the Host understands
+        // the filter; false means an older Host that ignores `workspace=`.
+        filterSupported: null,
         selectedId: '',
         transcript: null,
         rowPhase: 'idle',
@@ -137,28 +151,62 @@ window.__ModuleLoader__.load({
         // to be indistinguishable from 'no request happened at all'.
         const current = Number.isSafeInteger(store.state.listLimit) && store.state.listLimit > 0 ? store.state.listLimit : 50;
         const limit = Number.isSafeInteger(options.limit) && options.limit > 0 ? options.limit : current;
+        // The workspace to ask for: an explicit one when the selector just
+        // changed, otherwise whatever is in force. '' asks for the whole
+        // archive, which is also how a stale selection is dropped.
+        const workspace = typeof options.workspace === 'string' ? options.workspace : store.state.workspaceFilter;
         // Built by concatenation on purpose: an editor that eats `${...}` in a
         // template literal silently turned this into "?limit=", so the Host fell
         // back to its default page and "load more" reloaded the same page.
-        const query = '/sessions?limit=' + String(limit) + (options.force ? '&refresh=1' : '');
+        let query = '/sessions?limit=' + String(limit);
+        if (workspace !== '') query += '&workspace=' + encodeURIComponent(workspace);
+        if (options.force) query += '&refresh=1';
         const result = await api(query);
         const returned = (result.sessions || []).length;
+        const workspaceOptions = Array.isArray(result.workspaceOptions) ? result.workspaceOptions : [];
+        // The Host echoes the filter it applied. An older Host neither echoes
+        // nor understands the parameter, which the panel reports instead of
+        // showing a filter that is not in force.
+        const supported = typeof result.workspace === 'string';
+        const applied = supported ? result.workspace : '';
+        const ungroupedCount = Number.isSafeInteger(result.ungroupedCount) ? result.ungroupedCount : 0;
+        const stillExists = applied === ''
+          || workspaceOptions.some(option => option.id === applied)
+          || (applied === 'ungrouped' && ungroupedCount > 0);
+        // The selected workspace can lose its last archived session while the
+        // panel is open (restored elsewhere, or trimmed by "clean up leftovers").
+        // Its option is then gone, and a select showing nothing would strand the
+        // list on an empty page: fall back to "all" once.
+        if (!stillExists && options.retried !== true) {
+          store.set({ workspaceFilter: '' });
+          await loadSessions({ ...options, workspace: '', retried: true });
+          return;
+        }
         report('list:fetched', JSON.stringify({
           limit,
           url: query,
           returned,
           total: result.total ?? result.archivedCount,
           hasMore: result.hasMore === true,
+          workspace: applied,
           // Loud when the Host answered a different page size than requested.
           limitHonoured: returned === Math.min(limit, result.total ?? result.archivedCount ?? returned),
           titleSources: [...new Set((result.sessions || []).map(session => session.titleSource))]
         }));
         store.set({
           sessions: result.sessions || [],
-          listLimit: returned > 0 ? returned : limit,
+          // Keep the requested size as the baseline for "load more": a filtered
+          // page is short by nature, and shrinking the page size to it would
+          // make the next unfiltered request come back 3 rows long.
+          listLimit: Math.max(limit, returned),
           listTotal: result.total ?? result.archivedCount ?? returned,
+          visibleTotal: Number.isSafeInteger(result.visibleTotal) ? result.visibleTotal : (result.total ?? returned),
           listHasMore: result.hasMore === true,
           listHidden: result.hiddenCount ?? 0,
+          workspaceFilter: stillExists ? applied : '',
+          workspaceOptions,
+          ungroupedCount,
+          filterSupported: supported,
           listPhase: 'ready'
         });
       } catch (error) {
@@ -195,9 +243,17 @@ window.__ModuleLoader__.load({
 .aav-btnPrimary { border-color: var(--dsw-alias-brand-primary); }
 .aav-body { display: flex; flex: 1; min-height: 0; }
 .aav-side { width: 306px; min-width: 306px; display: flex; flex-direction: column; border-right: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-specific-sidebar-fill, var(--dsw-alias-bg-layer-1)); }
-.aav-sideTop { padding: 10px; border-bottom: 1px solid var(--dsw-alias-border-l1); }
+.aav-sideTop { display: flex; flex-direction: column; gap: 8px; padding: 10px; border-bottom: 1px solid var(--dsw-alias-border-l1); }
+/* Workspace selector row: a short label plus the control, so the control keeps
+   the leftover width instead of the label pushing the row out of the column. */
+.aav-field { display: flex; align-items: center; gap: 8px; }
+.aav-fieldLabel { flex: 0 0 auto; font-size: 11.5px; color: var(--dsw-alias-label-secondary); }
+.aav-fieldNote { font-size: 11px; color: var(--dsw-alias-label-secondary); }
 .aav-input { width: 100%; box-sizing: border-box; padding: 6px 9px; font: inherit; color: var(--dsw-alias-label-primary);
   background: var(--dsw-alias-bg-base); border: 1px solid var(--dsw-alias-border-l1); border-radius: 8px; }
+/* A select is not width:100% here: it takes the row's leftover width so a long
+   workspace title ellipsizes rather than widening the label row. */
+.aav-select { width: auto; flex: 1 1 auto; min-width: 0; }
 .aav-list { flex: 1; overflow: auto; padding: 6px; }
 .aav-row { display: block; width: 100%; text-align: left; padding: 8px 9px; margin-bottom: 4px; font: inherit; color: inherit;
   background: transparent; border: 1px solid transparent; border-radius: 9px; cursor: pointer; }
@@ -418,8 +474,12 @@ window.__ModuleLoader__.load({
       if (state.listPhase === 'loading') listStatus.push(h('div', { key: 'loading', className: 'aav-empty' }, t('loading.list')));
       if (state.listPhase === 'error') listStatus.push(h('div', { key: 'error', className: 'aav-empty aav-err' }, state.listError));
       if (state.listPhase === 'ready' && filtered.length === 0) {
-        listStatus.push(h('div', { key: 'empty', className: 'aav-empty' },
-          state.sessions.length === 0 ? t('empty.archive') : t('empty.filtered')));
+        // Three different empties: no archive at all, nothing in the chosen
+        // workspace, or the search box excluded everything that was loaded.
+        const emptyKey = state.listTotal === 0
+          ? (state.workspaceFilter === '' ? 'empty.archive' : 'empty.workspace')
+          : 'empty.filtered';
+        listStatus.push(h('div', { key: 'empty', className: 'aav-empty' }, t(emptyKey)));
       }
 
       const hiddenNote = state.listHidden > 0
@@ -484,7 +544,39 @@ window.__ModuleLoader__.load({
         }
       }
 
+      // The workspace selector sits above the search box: choosing a workspace
+      // is the coarse cut, typing is the fine one. Options and counts come from
+      // the Host's list payload, and the choice is applied by the Host over the
+      // whole archive — filtering the loaded page here would under-report.
+      const workspaceField = state.filterSupported === false
+        ? h('div', { key: 'unsupported', className: 'aav-fieldNote' }, t('filter.unavailable'))
+        : h('label', { key: 'workspace', className: 'aav-field' },
+            h('span', { className: 'aav-fieldLabel' }, t('filter.workspace')),
+            h('select', {
+              className: 'aav-input aav-select',
+              value: state.workspaceFilter,
+              'aria-label': t('filter.workspace'),
+              title: t('filter.workspace'),
+              onChange: (event) => {
+                const value = event.target.value;
+                store.set({ workspaceFilter: value });
+                // Returning the promise is what lets the offline harness await
+                // the request, exactly like the refresh and load-more handlers.
+                return loadSessions({ workspace: value });
+              }
+            },
+              h('option', { value: '' }, state.visibleTotal > 0
+                ? t('filter.workspace.allN', { n: state.visibleTotal })
+                : t('filter.workspace.all')),
+              state.ungroupedCount > 0
+                ? h('option', { value: 'ungrouped' }, t('filter.workspace.ungrouped', { n: state.ungroupedCount }))
+                : null,
+              state.workspaceOptions.map(option => h('option', { key: option.id, value: option.id, title: option.id },
+                t('filter.workspace.option', { title: option.title, n: option.count })))
+            ));
+
       const search = h('div', { className: 'aav-sideTop' },
+        workspaceField,
         h('input', {
           className: 'aav-input',
           type: 'search',
@@ -686,9 +778,16 @@ window.__ModuleLoader__.load({
             'action.hideInjected': '隐藏注入上下文',
             'action.showInjected': '显示注入上下文（{n}）',
             'search.placeholder': '搜索标题 / ID / 备注',
+            'filter.workspace': '工作区',
+            'filter.workspace.all': '全部工作区',
+            'filter.workspace.allN': '全部工作区（{n}）',
+            'filter.workspace.ungrouped': '未分组（{n}）',
+            'filter.workspace.option': '{title}（{n}）',
+            'filter.unavailable': '工作区筛选需要重启 DSH 后生效',
             'loading.list': '正在读取归档列表…',
             'loading.transcript': '正在读取会话正文…',
             'empty.archive': '当前没有已归档的会话',
+            'empty.workspace': '该工作区没有已归档的会话',
             'empty.filtered': '没有匹配的会话',
             'empty.select': '从左侧选择一条归档会话',
             'empty.block': '（无正文）',
@@ -734,9 +833,16 @@ window.__ModuleLoader__.load({
             'action.hideInjected': 'Hide injected context',
             'action.showInjected': 'Show injected context ({n})',
             'search.placeholder': 'Search title / ID / notes',
+            'filter.workspace': 'Workspace',
+            'filter.workspace.all': 'All workspaces',
+            'filter.workspace.allN': 'All workspaces ({n})',
+            'filter.workspace.ungrouped': 'Ungrouped ({n})',
+            'filter.workspace.option': '{title} ({n})',
+            'filter.unavailable': 'Workspace filtering needs a DSH restart',
             'loading.list': 'Reading the archive list…',
             'loading.transcript': 'Reading the session log…',
             'empty.archive': 'No archived sessions',
+            'empty.workspace': 'No archived sessions in this workspace',
             'empty.filtered': 'No matching sessions',
             'empty.select': 'Pick an archived session on the left',
             'empty.block': '(no content)',
