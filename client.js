@@ -483,6 +483,12 @@ window.__ModuleLoader__.load({
             visibility: style?.visibility,
             opacity: style?.opacity,
             color: style?.color,
+            // The resolved painter colour of the glyph itself, so a theme
+            // token that failed to resolve shows up as a value, not a guess.
+            iconStroke: (() => {
+              const svg = node.querySelector('svg');
+              return svg === null ? undefined : window.getComputedStyle(svg).stroke;
+            })(),
             label: node.getAttribute('aria-label') || '',
             parentClass: String(node.parentElement?.className ?? ''),
             // Whether our own stylesheet reached the document at all.
@@ -633,6 +639,7 @@ window.__ModuleLoader__.load({
     };
   }
 });
+
 
 
 
