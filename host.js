@@ -870,6 +870,40 @@ export function apply(ctx, config = {}) {
           return sendJson(res, 200, { ok: true, result: { sessionId, archived: false } });
         }
 
+        /**
+         * Drop one archived id whose session no longer exists anywhere.
+         *
+         * Such ids are debris: the session's directory, its persistence record
+         * and its projection checkpoint are all gone, yet the id stays in the
+         * archive set — which is why DSH's own session manager cannot show it
+         * (it lists sessions from the persistence index) while this list, which
+         * reports archive-set membership, still does.
+         *
+         * This only removes the id from the archive set. It touches no session
+         * content, and a session that still exists is refused.
+         */
+        if (req.method === "POST" && path === "/forget") {
+          const raw = await readBody(req);
+          let body = {};
+          if (raw.trim() !== "") {
+            try { body = JSON.parse(raw); }
+            catch { return sendJson(res, 400, { ok: false, error: "请求体不是合法 JSON" }); }
+          }
+          const sessionId = assertSessionId(body?.sessionId ?? "");
+          const artifactIndex = await artifacts();
+          const stillThere = artifactIndex.has(sessionId)
+            || (sessionQuery() !== undefined && (await sessionQuery().filterSessions([{ kind: "id", values: [sessionId] }])).length > 0);
+          if (stillThere) {
+            return sendJson(res, 409, {
+              ok: false,
+              error: "该会话在本机仍然存在，未清理；请改用「移出归档」或官方会话视图",
+              code: "session-exists"
+            });
+          }
+          await ctx.workspaceRegistry.unarchiveSession(sessionId);
+          return sendJson(res, 200, { ok: true, result: { sessionId, forgotten: true } });
+        }
+
         // Page-side diagnostics: the Client half and the paste-once probe post
         // what only the browser can observe (factory execution, render failure,
         // footer DOM). Read-only for the Host: capped, kept in memory, never

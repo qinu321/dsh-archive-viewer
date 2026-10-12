@@ -232,6 +232,7 @@ window.__ModuleLoader__.load({
 .aav-summary { cursor: pointer; padding: 6px 10px; font-size: 11px; color: var(--dsw-alias-label-secondary); }
 .aav-err { color: var(--dsw-alias-state-error-primary); }
 .aav-hiddenNote { padding: 6px 10px 0; font-size: 11px; }
+.aav-rowAction { text-align: center; font-size: 11.5px; color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); }
 .aav-loadMore { text-align: center; color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); }
 .aav-empty { padding: 24px; color: var(--dsw-alias-label-secondary); text-align: center; }
 /* Footer entry geometry. Deliberately an icon-only square in BOTH sidebar
@@ -436,22 +437,52 @@ window.__ModuleLoader__.load({
             : t('action.loadMore', { n: Math.max(0, state.listTotal - state.sessions.length) }))
         : null;
 
-      const rows = filtered.map(session => {
+      const rows = [];
+      for (const session of filtered) {
+        const dead = session.persisted === false;
         const meta = [
           formatTime(session.createdAt),
           session.workspaceTitle || '',
           formatBytes(session.bytes),
-          session.persisted ? '' : t('badge.missing')
+          dead ? t('badge.dead') : ''
         ].filter(Boolean).join(' · ');
-        return h('button', {
+        rows.push(h('button', {
           key: session.id,
           type: 'button',
           className: 'aav-row' + (session.id === state.selectedId ? ' aav-rowActive' : ''),
-          onClick: () => loadTranscript(session.id)
+          onClick: () => { if (!dead) loadTranscript(session.id); }
         },
           h('span', { className: 'aav-rowTitle' }, sessionLabel(session)),
-          h('span', { className: 'aav-rowMeta' }, meta));
-      });
+          h('span', { className: 'aav-rowMeta' }, meta)));
+        // A row whose session is gone everywhere (no directory, no persistence
+        // record, no checkpoint) is debris in the archive set: DSH's own session
+        // manager cannot even list it. Offer the one useful action — drop it.
+        if (dead) {
+          rows.push(h('button', {
+            key: session.id + ':forget',
+            type: 'button',
+            className: 'aav-row aav-rowAction',
+            onClick: async () => {
+              store.set({ notice: '' });
+              try {
+                const result = await api('/forget', {
+                  method: 'POST',
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ sessionId: session.id })
+                });
+                store.set({
+                  sessions: store.state.sessions.filter(entry => entry.id !== session.id),
+                  listTotal: Math.max(0, store.state.listTotal - 1),
+                  listHidden: store.state.listHidden,
+                  notice: t('notice.forgotten', { id: result?.sessionId ?? session.id })
+                });
+              } catch (error) {
+                store.set({ notice: t('notice.forgetFailed', { message: error.message }) });
+              }
+            }
+          }, t('action.forget')));
+        }
+      }
 
       const search = h('div', { className: 'aav-sideTop' },
         h('input', {
@@ -663,6 +694,10 @@ window.__ModuleLoader__.load({
             'empty.block': '（无正文）',
             'badge.readonly': '只读',
             'badge.missing': '日志缺失',
+            'badge.dead': '会话已不存在',
+            'action.forget': '清理这条残留记录',
+            'notice.forgotten': '已从归档集移除残留记录 {id}',
+            'notice.forgetFailed': '清理失败：{message}',
             'badge.interrupted': '被打断',
             'banner.readonly': '归档状态未被改动，此视图不写入任何会话状态。',
             'notice.truncated': '仅显示最近 {n} 条记录，更早的内容未在此视图加载。',
@@ -707,6 +742,10 @@ window.__ModuleLoader__.load({
             'empty.block': '(no content)',
             'badge.readonly': 'read-only',
             'badge.missing': 'log missing',
+            'badge.dead': 'session no longer exists',
+            'action.forget': 'Remove this leftover record',
+            'notice.forgotten': 'Removed leftover record {id} from the archive set',
+            'notice.forgetFailed': 'Cleanup failed: {message}',
             'badge.interrupted': 'interrupted',
             'banner.readonly': 'Archive state untouched; this view writes no session state.',
             'notice.truncated': 'Showing the {n} most recent rows; earlier content is not loaded here.',
@@ -767,6 +806,7 @@ window.__ModuleLoader__.load({
     };
   }
 });
+
 
 
 

@@ -306,6 +306,46 @@ check("the hidden count is reported", filtered.hiddenCount === 1, String(filtere
 check("the archive-set size is still reported", filtered.archivedIdCount === 2, String(filtered.archivedIdCount));
 check("an excluded session is never folded", filtered.sessions.every(session => session.id !== "session-workbench"));
 
+// --- 5b-2. leftover archive-set ids can be cleaned up ----------------------
+// An id can stay in the archive set after its session is gone everywhere
+// (directory, persistence record, checkpoint). DSH's own session manager lists
+// sessions from the persistence index, so it cannot even show such a row; this
+// list reports set membership, so it must offer the one honest action.
+const GHOST_ID = "session-does-not-exist";
+const forgetCalls = [];
+const forgetCtx = {
+  ...fakeCtx,
+  workspaceRegistry: {
+    archivedSessionIds: [ARCHIVED_ID, GHOST_ID],
+    list: () => [],
+    unarchiveSession: async (id) => { forgetCalls.push(id); }
+  },
+  sessionQuery: {
+    ...fakeCtx.sessionQuery,
+    // The ghost has no record; the real session does.
+    filterSessions: async (filters) => (filters[0]?.values ?? []).filter(id => id === ARCHIVED_ID).map(id => ({ header: { id, cwd: "E:\\codeVibe\\debug", createdAt: 1, version: 4, isSeeded: false }, live: false, persisted: true }))
+  }
+};
+let forgetHandler;
+apply({ ...forgetCtx, webServer: { register(definition) { forgetHandler = definition.handler; return () => {}; } }, effect(callback) { callback(); return () => {}; }, get: (key) => (key === "sessionQuery" ? forgetCtx.sessionQuery : undefined) }, { dshHome: "E:\\nonexistent" });
+
+async function callOn(handler, url, body) {
+  const res = fakeRes();
+  await handler(fakeReq(url, body), res);
+  return { status: res.captured.status, payload: JSON.parse(res.captured.body) };
+}
+
+const ghost = await callOn(forgetHandler, `${API_PREFIX}/forget`, { sessionId: GHOST_ID });
+check("a leftover id is removed from the archive set", ghost.status === 200 && ghost.payload?.result?.forgotten === true, JSON.stringify(ghost.payload));
+check("cleanup unarchives exactly that id", forgetCalls.length === 1 && forgetCalls[0] === GHOST_ID, JSON.stringify(forgetCalls));
+
+const existing = await callOn(forgetHandler, `${API_PREFIX}/forget`, { sessionId: ARCHIVED_ID });
+check("a session that still exists is refused", existing.status === 409 && existing.payload?.code === "session-exists", JSON.stringify(existing.payload));
+check("a refused cleanup writes nothing", forgetCalls.length === 1, JSON.stringify(forgetCalls));
+
+const badForget = await callOn(forgetHandler, `${API_PREFIX}/forget`, { sessionId: "../etc" });
+check("a path-shaped cleanup target is rejected", badForget.status === 400, JSON.stringify(badForget.payload));
+
 // --- 5c. title folding is cached against the artifact fingerprint ----------
 // The list route used to decompress every archived artifact on every request
 // (~2.3s for 63.9MB here). Folding must now happen once per unchanged log.
@@ -495,6 +535,7 @@ if (process.env.ARCHIVE_VIEWER_LIVE === "1") {
 console.log(results.join("\n"));
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${results.length - failures}/${results.length} checks`);
 process.exit(failures === 0 ? 0 : 1);
+
 
 
 
