@@ -20,6 +20,8 @@ import {
   assistantParts,
   buildRows,
   configDshHome,
+  configExcludedPaths,
+  isExcludedWorkspace,
   collectCallMeta,
   contentText,
   isInjectedRow,
@@ -89,6 +91,26 @@ check("isInjectedRow separates injected rows", (() => {
   ], undefined);
   return rows.items.filter(isInjectedRow).length === 2 && rows.items.filter(row => !isInjectedRow(row)).length === 1;
 })());
+
+// --- 2c. internal workbench sessions stay out of the archive list ---------
+// The memory plugin's workbench archives and deletes its own sessions, so its
+// leftovers are noise here and are the stale ids that cost a fold per request.
+const WORKBENCH = "E:\\DeepSeek Harness\\aik_auto_memory_use";
+const debugPath = "E:\\codeVibe\\debug";
+check("a workbench session is excluded by default", isExcludedWorkspace(WORKBENCH, configExcludedPaths({})) === true);
+check("an ordinary workspace is kept", isExcludedWorkspace(debugPath, configExcludedPaths({})) === false);
+check("a path with forward slashes and a trailing slash still matches",
+  isExcludedWorkspace("E:/DeepSeek Harness/aik_auto_memory_use/", configExcludedPaths({})) === true);
+check("the comparison ignores drive-letter case",
+  isExcludedWorkspace("e:\\deepseek harness\\AIK_AUTO_MEMORY_USE", configExcludedPaths({})) === true);
+check("a partial word does not match", isExcludedWorkspace("E:\\x\\aik_auto_memory_use_backup", configExcludedPaths({})) === false);
+check("a nested path under the excluded root matches",
+  isExcludedWorkspace("E:\\codeVibe\\tmp\\aik_auto_memory_use\\sub", configExcludedPaths({})) === true);
+check("an empty or missing cwd is never excluded",
+  isExcludedWorkspace(undefined, configExcludedPaths({})) === false && isExcludedWorkspace("", configExcludedPaths({})) === false);
+check("an explicit empty list disables the exclusion", isExcludedWorkspace(WORKBENCH, configExcludedPaths({ excludeWorkspacePaths: [] })) === false);
+check("extra paths append to the default", isExcludedWorkspace("E:\\codeVibe\\scratch", configExcludedPaths({ excludeWorkspacePaths: ["E:\\codeVibe\\scratch"] })) === true);
+check("a non-array exclusion config is rejected", (() => { try { configExcludedPaths({ excludeWorkspacePaths: "x" }); return false; } catch { return true; } })());
 
 // --- 3. transcript fold ---------------------------------------------------
 const synthetic = [
@@ -257,6 +279,32 @@ const failed = fakeRes();
 await brokenHandler(fakeReq(`${API_PREFIX}/transcript?sessionId=${encodeURIComponent(ARCHIVED_ID)}`), failed);
 const failedPayload = JSON.parse(failed.captured.body);
 check("a read failure is reported, not thrown", failedPayload.ok === false && failedPayload.error.includes("log unreadable"), failed.captured.body.slice(0, 160));
+
+// The list itself must drop them and report how many it dropped.
+const mixedIds = ["session-keep", "session-workbench"];
+const mixedQuery = {
+  ...fakeCtx.sessionQuery,
+  filterSessions: async (filters) => (filters[0]?.values ?? []).map(id => ({
+    header: { id, cwd: id === "session-workbench" ? WORKBENCH : debugPath, createdAt: 5, version: 4, isSeeded: false },
+    live: false,
+    persisted: true
+  })),
+  readTitleSnapshots: async (ids) => ids.map(id => ({ sessionId: id, status: "fulfilled", value: { title: { title: `t-${id}` } } }))
+};
+const filtered = await listArchived({
+  workspaceRegistry: { archivedSessionIds: mixedIds, list: () => [] },
+  sessionQuery: mixedQuery,
+  sessionsRoot: "unused",
+  artifactIndex: new Map(mixedIds.map(id => [id, { path: id, bytes: 5, mtime: 1, project: "p" }])),
+  titleCache: new Map(),
+  projectionCache: undefined,
+  excludedPaths: configExcludedPaths({})
+});
+check("the workbench session is not listed", filtered.sessions.length === 1 && filtered.sessions[0].id === "session-keep",
+  JSON.stringify(filtered.sessions.map(session => session.id)));
+check("the hidden count is reported", filtered.hiddenCount === 1, String(filtered.hiddenCount));
+check("the archive-set size is still reported", filtered.archivedIdCount === 2, String(filtered.archivedIdCount));
+check("an excluded session is never folded", filtered.sessions.every(session => session.id !== "session-workbench"));
 
 // --- 5c. title folding is cached against the artifact fingerprint ----------
 // The list route used to decompress every archived artifact on every request
@@ -447,6 +495,9 @@ if (process.env.ARCHIVE_VIEWER_LIVE === "1") {
 console.log(results.join("\n"));
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${results.length - failures}/${results.length} checks`);
 process.exit(failures === 0 ? 0 : 1);
+
+
+
 
 
 

@@ -55,6 +55,57 @@ export function resolveDshHome(configured) {
 /** Absolute route prefix the Host registers and the browser addresses. */
 export const API_PREFIX = "/archive-viewer/api";
 
+/**
+ * Workspaces whose archived sessions are internal machinery, not conversations:
+ * the memory plugin's background workbench creates and deletes its sessions on
+ * its own, so they archive themselves and their artifact disappears (that is
+ * also the source of the stale archived id whose fold used to cost ~85ms per
+ * request). Excluded by the session's own `cwd`, so nothing is read to decide.
+ *
+ * Overridable through the row's config: `excludeWorkspacePaths: []` shows
+ * everything again, and extra paths append to the default.
+ */
+export const DEFAULT_EXCLUDED_WORKSPACE_PATHS = ["aik_auto_memory_use"];
+
+/** Read the exclusion list from one row's config. */
+export function configExcludedPaths(config) {
+  const value = config?.excludeWorkspacePaths;
+  if (value === undefined || value === null) return [...DEFAULT_EXCLUDED_WORKSPACE_PATHS];
+  if (!Array.isArray(value) || value.some(item => typeof item !== "string")) {
+    throw new Error("excludeWorkspacePaths 必须是字符串数组");
+  }
+  return value
+    .map(item => item.trim())
+    .filter(item => item !== "")
+    .map(item => (item === "~" || item.startsWith("~/") || item.startsWith("~\\") ? join(homedir(), item.slice(2)) : item));
+}
+
+/**
+ * Whether one session is hidden from the archive list.
+ *
+ * The session's `cwd` is compared after normalizing separators and case, so a
+ * path with a trailing slash, mixed separators, or a different drive-letter
+ * casing still matches; a directory name matches when it is a path segment or
+ * a suffix of the path, never a partial word.
+ * @param cwd - the session's working directory as DSH reports it.
+ * @param excluded - configured exclusion patterns.
+ * @returns whether the session should be left out of the list.
+ */
+export function isExcludedWorkspace(cwd, excluded) {
+  if (typeof cwd !== "string" || cwd === "" || excluded === undefined) return false;
+  const normalize = (value) => value.replace(/[\\/]+/g, "/").replace(/\/+$/, "").toLowerCase();
+  const target = normalize(cwd);
+  const segments = target.split("/").filter(segment => segment !== "");
+  return excluded.some(pattern => {
+    const needle = normalize(pattern);
+    if (needle === "") return false;
+    if (needle.includes("/")) return target === needle || target.startsWith(`${needle}/`);
+    // A bare name matches a whole path segment, or the session's own `cwd`
+    // when DSH reports a project directory rather than a full path.
+    return segments.includes(needle) || target === needle;
+  });
+}
+
 /** Durable artifact filenames, newest generation first. */
 const ARTIFACT_NAMES = [
   "session.v4.jsonl.zstd",
@@ -531,7 +582,7 @@ export async function transcriptFor(sessionQuery, sessionId) {
 /** Archive-list payload: registry membership, workspace title, folded title,
  * artifact statistics. Persistence-derived values are best-effort per id so
  * one unreadable session cannot fail the whole list. */
-export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRoot, artifactIndex, titleCache, projectionCache, projectionCacheDir, dshHome, page, timings }) {
+export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRoot, artifactIndex, titleCache, projectionCache, projectionCacheDir, dshHome, page, excludedPaths, timings }) {
   const mark = () => Date.now();
   const spent = {};
   const started = mark();
@@ -560,6 +611,21 @@ export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRo
   spent.filterFirstFields = filterFirstFields;
   if (filterError !== undefined) spent.filterError = filterError;
 
+  // Internal machinery stays out of the archive list: the memory plugin's
+  // workbench sessions archive and delete themselves, so they are noise here
+  // and their leftover ids are the stale entries that cost a fold each request.
+  // Filtering uses the header DSH already supplied (or the artifact's project
+  // directory), so nothing extra is read to decide.
+  const hiddenByPath = [];
+  const visibleIds = archivedIds.filter(id => {
+    const cwd = records.get(id)?.header?.cwd ?? artifactIndex?.get(id)?.project;
+    if (!isExcludedWorkspace(cwd, excludedPaths)) return true;
+    hiddenByPath.push(id);
+    return false;
+  });
+  spent.hiddenByPath = hiddenByPath.length;
+  spent.hiddenSample = hiddenByPath.slice(0, 3);
+
   const from = mark();
   const index = artifactIndex ?? await scanSessionArtifacts(sessionsRoot);
   spent.scanMs = mark() - from;
@@ -568,7 +634,7 @@ export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRo
   // the page size, so latency stays flat while the archive grows. `hasMore`
   // tells the reader there is another page.
   const pageSize = Number.isSafeInteger(page) && page > 0 ? Math.min(page, MAX_LIST_LIMIT) : DEFAULT_LIST_LIMIT;
-  const pageIds = archivedIds.slice(0, pageSize);
+  const pageIds = visibleIds.slice(0, pageSize);
 
   // Titles, cheapest source first. Measured here: reading all 52 persisted
   // checkpoints costs ~14ms, while folding one title out of a log costs ~44ms
@@ -686,13 +752,18 @@ export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRo
   });
   sessions.sort((a, b) => (b.createdAt ?? b.mtime ?? 0) - (a.createdAt ?? a.mtime ?? 0));
   spent.totalMs = mark() - started;
-  spent.archived = archivedIds.length;
+  spent.archived = visibleIds.length;
+  spent.archivedAll = archivedIds.length;
   if (timings !== undefined) Object.assign(timings, spent);
   return {
     sessions,
-    archivedCount: archivedIds.length,
-    total: archivedIds.length,
-    hasMore: archivedIds.length > pageIds.length,
+    // Both counts are reported, so the reader can say "N hidden" without
+    // misreporting how many ids the archive set actually holds.
+    archivedCount: visibleIds.length,
+    total: visibleIds.length,
+    hiddenCount: hiddenByPath.length,
+    archivedIdCount: archivedIds.length,
+    hasMore: visibleIds.length > pageIds.length,
     // Folded per page in newest-first order, so "load more" walks the archive
     // without ever resolving more titles than the page it is showing.
     timings: spent
@@ -715,6 +786,8 @@ export function apply(ctx, config = {}) {
    * changes the stamp and the entry is refolded on its own.
    */
   const titleCache = new Map();
+  /** Workspaces whose archived sessions are machinery, not conversations. */
+  const excludedPaths = configExcludedPaths(config);
   /** Last page-side diagnostic report; memory only, replaced on every post. */
   let lastDiagnostic = null;
   const artifacts = async (force = false) => {
@@ -753,6 +826,7 @@ export function apply(ctx, config = {}) {
             // the same checkpoint read straight off disk for a cold table.
             projectionCache: ctx.get("sessionProjectionCache"),
             projectionCacheDir: join(dshHome, ...PROJECTION_CACHE_SEGMENTS),
+            excludedPaths,
             page: Number.isSafeInteger(rawLimit) && rawLimit > 0 ? rawLimit : undefined
           });
           return sendJson(res, 200, { ok: true, result });

@@ -278,6 +278,66 @@ const shownElements = collect(expandAll(probeRegistration.component(ownerProps))
 check('flipping the toggle brings injected rows back', shownElements.some(element => String(element.props?.className ?? '').includes('aav-injected')));
 setProbeState({ hideInjected: true, open: false, rowPhase: 'idle', transcript: null });
 
+// --- 5f. the list URL must carry the page size ----------------------------
+const listUrls = [];
+globalThis.fetch = async (url) => {
+  // Diagnostics posts ride the same fetch; the list assertions must ignore them.
+  if (!String(url).includes('/diagnostic')) listUrls.push(String(url));
+  return {
+    status: 200,
+    async json() {
+      return {
+        ok: true,
+        result: {
+          sessions: new Array(50).fill(0).map((_, index) => ({ id: 's' + index, title: 't' + index, titleSource: 'checkpoint', bytes: 10, createdAt: index })),
+          total: 52,
+          archivedCount: 52,
+          hasMore: true
+        }
+      };
+    }
+  };
+};
+
+/** Render the panel with the dialog open and return its elements. */
+function renderPanel() {
+  return collect(expandAll(probeRegistration.component(ownerProps)));
+}
+
+/** Click one rendered button by its visible text and wait for its promise. */
+async function clickByText(text) {
+  const button = renderPanel().find(element => element.type === 'button' && String(element.props?.children ?? '').includes(text));
+  if (button === undefined) return false;
+  await button.props.onClick({ preventDefault() {} });
+  return true;
+}
+
+setProbeState({ open: true, listPhase: 'ready', listHasMore: true, listLimit: 50, listTotal: 52 });
+const beforeMore = listUrls.length;
+const clickedMore = await clickByText('加载更多');
+const moreUrl = listUrls[beforeMore];
+check('the panel renders a load-more control', clickedMore, 'no button with the load-more label');
+check('a load-more request carries the bigger page size',
+  typeof moreUrl === 'string' && moreUrl.endsWith('?limit=100'), String(moreUrl));
+const beforeRefresh = listUrls.length;
+const refreshed = await (async () => {
+  const panel = renderPanel();
+  const refresh = panel.find(element => element.type === 'button' && String(element.props?.children ?? '') === '刷新');
+  if (refresh === undefined) return false;
+  await refresh.props.onClick({ preventDefault() {} });
+  return true;
+})();
+const refreshUrl = listUrls[beforeRefresh];
+// The refresh keeps the page size the Host last served, and adds the cache reset.
+const servedLimit = String(probeInstance.__state.listLimit);
+check('a forced refresh carries the served page size and the cache reset',
+  refreshed && typeof refreshUrl === 'string' && refreshUrl === '/archive-viewer/api/sessions?limit=' + servedLimit + '&refresh=1', String(refreshUrl) + ' vs served ' + servedLimit);
+// The Host echoes the page it actually served; that becomes the next request
+// size so pressing more again cannot silently re-ask for the same page.
+check('the served page size becomes the next request size',
+  probeInstance.__state.listLimit === 50, String(probeInstance.__state.listLimit));
+setProbeState({ open: false, listHasMore: false });
+
 // --- 6. diagnostics channel ----------------------------------------------
 const posted = [];
 globalThis.fetch = async (url, options) => {
@@ -301,6 +361,8 @@ check('diagnostics post to the plugin own route', posted.every(entry => entry.ur
 console.log(results.join("\n"));
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${results.length - failures}/${results.length} checks`);
 process.exit(failures === 0 ? 0 : 1);
+
+
 
 
 
