@@ -123,10 +123,12 @@ window.__ModuleLoader__.load({
       return session.id;
     }
 
-    async function loadSessions() {
+    async function loadSessions(options = {}) {
       store.set({ listPhase: 'loading', listError: '' });
       try {
-        const result = await api('/sessions');
+        // A manual refresh drops the Host's title/scan caches; ordinary opens
+        // reuse them so the list paints without re-inflating any session log.
+        const result = await api(options.force ? '/sessions?refresh=1' : '/sessions');
         store.set({ sessions: result.sessions || [], listPhase: 'ready' });
       } catch (error) {
         store.set({ listPhase: 'error', listError: error.message });
@@ -421,7 +423,7 @@ window.__ModuleLoader__.load({
         h('h2', null, t('panel.title')),
         h('span', { className: 'aav-headSub' }, t('panel.count', { n: state.sessions.length })),
         h('span', { className: 'aav-spacer' }),
-        h('button', { type: 'button', className: 'aav-btn', onClick: () => loadSessions() }, t('action.refresh')),
+        h('button', { type: 'button', className: 'aav-btn', onClick: () => loadSessions({ force: true }) }, t('action.refresh')),
         h('button', { type: 'button', className: 'aav-btn', onClick: onClose }, t('action.close')));
 
       return h(React.Fragment, null, h('style', null, CSS), h('div', { className: 'aav-root' }, header, body));
@@ -710,6 +712,7 @@ window.__ModuleLoader__.load({
     };
   }
 });
+
 
 
 

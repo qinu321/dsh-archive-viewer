@@ -24,6 +24,7 @@ import {
   contentText,
   isInjectedRow,
   formatToolArgs,
+  listArchived,
   resolveDshHome,
   safeErrorMessage
 } from "./host.js";
@@ -257,6 +258,36 @@ await brokenHandler(fakeReq(`${API_PREFIX}/transcript?sessionId=${encodeURICompo
 const failedPayload = JSON.parse(failed.captured.body);
 check("a read failure is reported, not thrown", failedPayload.ok === false && failedPayload.error.includes("log unreadable"), failed.captured.body.slice(0, 160));
 
+// --- 5c. title folding is cached against the artifact fingerprint ----------
+// The list route used to decompress every archived artifact on every request
+// (~2.3s for 63.9MB here). Folding must now happen once per unchanged log.
+const foldCalls = [];
+const cacheQuery = {
+  ...fakeCtx.sessionQuery,
+  readTitleSnapshots: async (ids) => {
+    foldCalls.push([...ids]);
+    return ids.map(id => ({ sessionId: id, status: "fulfilled", value: { title: { title: `t-${foldCalls.length}` } } }));
+  }
+};
+const cacheArtifacts = new Map([[ARCHIVED_ID, { path: "x", bytes: 100, mtime: 1000, project: "p" }]]);
+const registry = fakeCtx.workspaceRegistry;
+const titleCache = new Map();
+
+const first = await listArchived({ workspaceRegistry: registry, sessionQuery: cacheQuery, sessionsRoot: "unused", artifactIndex: cacheArtifacts, titleCache });
+check("the first list folds the title", foldCalls.length === 1 && foldCalls[0].length === 1, JSON.stringify(foldCalls));
+check("the folded title is returned", first.sessions[0].title === "t-1", String(first.sessions[0].title));
+check("the first list reports a cache miss", first.timings.titleCacheMisses === 1 && first.timings.titleCacheHits === 0, JSON.stringify(first.timings));
+
+const second = await listArchived({ workspaceRegistry: registry, sessionQuery: cacheQuery, sessionsRoot: "unused", artifactIndex: cacheArtifacts, titleCache });
+check("an unchanged log is not re-folded", foldCalls.length === 1, `folds=${foldCalls.length}`);
+check("the cached title is served", second.sessions[0].title === "t-1", String(second.sessions[0].title));
+check("the second list reports a cache hit with no fold time", second.timings.titleCacheHits === 1 && second.timings.foldMs === 0, JSON.stringify(second.timings));
+
+const rewritten = new Map([[ARCHIVED_ID, { path: "x", bytes: 120, mtime: 2000, project: "p" }]]);
+const third = await listArchived({ workspaceRegistry: registry, sessionQuery: cacheQuery, sessionsRoot: "unused", artifactIndex: rewritten, titleCache });
+check("a rewritten log is folded again", foldCalls.length === 2, `folds=${foldCalls.length}`);
+check("the refolded title replaces the cached one", third.sessions[0].title === "t-2", String(third.sessions[0].title));
+
 // --- 6. client artifact ---------------------------------------------------
 const clientSource = readFileSync(new URL("./client.js", import.meta.url), "utf8");
 check("client registers through the module loader", clientSource.includes("__ModuleLoader__.load"));
@@ -307,5 +338,6 @@ if (process.env.ARCHIVE_VIEWER_LIVE === "1") {
 console.log(results.join("\n"));
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${results.length - failures}/${results.length} checks`);
 process.exit(failures === 0 ? 0 : 1);
+
 
 
