@@ -83,6 +83,14 @@ window.__ModuleLoader__.load({
         // null until the first list response says whether the Host understands
         // the filter; false means an older Host that ignores `workspace=`.
         filterSupported: null,
+        // Set when the Host reported that the selected workspace no longer has
+        // archived sessions and the reader fell back to "all": the selection
+        // must not vanish silently.
+        filterDropped: false,
+        // Set when the Host could not resolve session ownership at all (its
+        // persistence read failed). Every session then looks ungrouped, so a
+        // filtered answer of "nothing" says nothing about that workspace.
+        groupingFailed: false,
         selectedId: '',
         transcript: null,
         rowPhase: 'idle',
@@ -142,7 +150,17 @@ window.__ModuleLoader__.load({
       return session.id;
     }
 
+    /**
+     * Monotonic id of the newest list request. Only that request may write the
+     * list state: the selector fires a request per change and the fallback below
+     * fires one of its own, so without this an older answer would land on top of
+     * the user's latest choice (measured: pick B, then A's slower answer puts
+     * the screen back on A). `loadTranscript` has the same guard per session.
+     */
+    let listSeq = 0;
+
     async function loadSessions(options = {}) {
+      const seq = ++listSeq;
       store.set({ listPhase: 'loading', listError: '' });
       try {
         // A manual refresh drops the Host's title/scan caches; ordinary opens
@@ -162,6 +180,7 @@ window.__ModuleLoader__.load({
         if (workspace !== '') query += '&workspace=' + encodeURIComponent(workspace);
         if (options.force) query += '&refresh=1';
         const result = await api(query);
+        if (seq !== listSeq) return;
         const returned = (result.sessions || []).length;
         const workspaceOptions = Array.isArray(result.workspaceOptions) ? result.workspaceOptions : [];
         // The Host echoes the filter it applied. An older Host neither echoes
@@ -170,15 +189,21 @@ window.__ModuleLoader__.load({
         const supported = typeof result.workspace === 'string';
         const applied = supported ? result.workspace : '';
         const ungroupedCount = Number.isSafeInteger(result.ungroupedCount) ? result.ungroupedCount : 0;
-        const stillExists = applied === ''
+        // With the ownership read failed, EVERY session looks ungrouped: an
+        // empty answer for a workspace means "cannot tell", not "nothing there".
+        // The selection is therefore kept, and the reader says what happened.
+        const groupingFailed = result.groupingFailed === true;
+        const stillExists = groupingFailed
+          || applied === ''
           || workspaceOptions.some(option => option.id === applied)
           || (applied === 'ungrouped' && ungroupedCount > 0);
         // The selected workspace can lose its last archived session while the
         // panel is open (restored elsewhere, or trimmed by "clean up leftovers").
         // Its option is then gone, and a select showing nothing would strand the
-        // list on an empty page: fall back to "all" once.
+        // list on an empty page: fall back to "all" once, and say so — a
+        // selection that clears itself without a word reads as a bug.
         if (!stillExists && options.retried !== true) {
-          store.set({ workspaceFilter: '' });
+          if (seq === listSeq) store.set({ workspaceFilter: '', filterDropped: true });
           await loadSessions({ ...options, workspace: '', retried: true });
           return;
         }
@@ -206,12 +231,18 @@ window.__ModuleLoader__.load({
           workspaceFilter: stillExists ? applied : '',
           workspaceOptions,
           ungroupedCount,
+          groupingFailed,
           filterSupported: supported,
           listPhase: 'ready'
         });
       } catch (error) {
+        // A superseded request must not paint its failure over the newer one.
+        if (seq !== listSeq) return;
         report('list:failed', String(error && error.message));
-        store.set({ listPhase: 'error', listError: error.message });
+        // Drop the rows: they belong to the previous query, and leaving them
+        // under a changed selector claims "this workspace holds these sessions".
+        // The options stay, so the reader can still switch somewhere else.
+        store.set({ listPhase: 'error', listError: error.message, sessions: [], listTotal: 0 });
       }
     }
 
@@ -251,8 +282,9 @@ window.__ModuleLoader__.load({
 .aav-fieldNote { font-size: 11px; color: var(--dsw-alias-label-secondary); }
 .aav-input { width: 100%; box-sizing: border-box; padding: 6px 9px; font: inherit; color: var(--dsw-alias-label-primary);
   background: var(--dsw-alias-bg-base); border: 1px solid var(--dsw-alias-border-l1); border-radius: 8px; }
-/* A select is not width:100% here: it takes the row's leftover width so a long
-   workspace title ellipsizes rather than widening the label row. */
+/* A select is not width:100% here: it takes the row's leftover width, so a long
+   workspace title is clipped inside the control rather than widening the label
+   row (a native select cannot ellipsize its own value). */
 .aav-select { width: auto; flex: 1 1 auto; min-width: 0; }
 .aav-list { flex: 1; overflow: auto; padding: 6px; }
 .aav-row { display: block; width: 100%; text-align: left; padding: 8px 9px; margin-bottom: 4px; font: inherit; color: inherit;
@@ -474,16 +506,25 @@ window.__ModuleLoader__.load({
       if (state.listPhase === 'loading') listStatus.push(h('div', { key: 'loading', className: 'aav-empty' }, t('loading.list')));
       if (state.listPhase === 'error') listStatus.push(h('div', { key: 'error', className: 'aav-empty aav-err' }, state.listError));
       if (state.listPhase === 'ready' && filtered.length === 0) {
-        // Three different empties: no archive at all, nothing in the chosen
-        // workspace, or the search box excluded everything that was loaded.
-        const emptyKey = state.listTotal === 0
-          ? (state.workspaceFilter === '' ? 'empty.archive' : 'empty.workspace')
-          : 'empty.filtered';
+        // Four different empties: no archive at all, ownership unreadable (so a
+        // filtered answer proves nothing), nothing in the chosen workspace, or
+        // the search box excluded everything that was loaded.
+        const emptyKey = state.groupingFailed && state.workspaceFilter !== ''
+          ? 'empty.grouping'
+          : state.listTotal === 0
+            ? (state.workspaceFilter === '' ? 'empty.archive' : 'empty.workspace')
+            : 'empty.filtered';
         listStatus.push(h('div', { key: 'empty', className: 'aav-empty' }, t(emptyKey)));
       }
 
       const hiddenNote = state.listHidden > 0
         ? h('div', { key: 'hidden', className: 'aav-rowMeta aav-hiddenNote' }, t('panel.hidden', { n: state.listHidden }))
+        : null;
+
+      // A dropped selection has to be stated where the selector is, not silently
+      // applied: otherwise the dropdown just jumps back to "all" on its own.
+      const droppedNote = state.filterDropped && state.listPhase === 'ready' && state.workspaceFilter === ''
+        ? h('div', { key: 'dropped', className: 'aav-rowMeta aav-hiddenNote' }, t('notice.filterDropped'))
         : null;
 
       const loadMore = state.listHasMore
@@ -553,13 +594,13 @@ window.__ModuleLoader__.load({
         : h('label', { key: 'workspace', className: 'aav-field' },
             h('span', { className: 'aav-fieldLabel' }, t('filter.workspace')),
             h('select', {
+              // No aria-label: the wrapping <label> supplies the accessible name,
+              // and an aria-label here would override the visible text.
               className: 'aav-input aav-select',
               value: state.workspaceFilter,
-              'aria-label': t('filter.workspace'),
-              title: t('filter.workspace'),
               onChange: (event) => {
                 const value = event.target.value;
-                store.set({ workspaceFilter: value });
+                store.set({ workspaceFilter: value, filterDropped: false });
                 // Returning the promise is what lets the offline harness await
                 // the request, exactly like the refresh and load-more handlers.
                 return loadSessions({ workspace: value });
@@ -571,7 +612,9 @@ window.__ModuleLoader__.load({
               state.ungroupedCount > 0
                 ? h('option', { value: 'ungrouped' }, t('filter.workspace.ungrouped', { n: state.ungroupedCount }))
                 : null,
-              state.workspaceOptions.map(option => h('option', { key: option.id, value: option.id, title: option.id },
+              // The directory is the one thing that tells two same-titled
+              // workspaces apart, so it is the option's tooltip.
+              state.workspaceOptions.map(option => h('option', { key: option.id, value: option.id, title: option.path || option.title },
                 t('filter.workspace.option', { title: option.title, n: option.count })))
             ));
 
@@ -586,7 +629,7 @@ window.__ModuleLoader__.load({
           onChange: (event) => store.set({ query: event.target.value })
         }));
 
-      const side = h('div', { className: 'aav-side' }, search, h('div', { className: 'aav-list' }, listStatus, rows, loadMore, hiddenNote));
+      const side = h('div', { className: 'aav-side' }, search, h('div', { className: 'aav-list' }, listStatus, droppedNote, rows, loadMore, hiddenNote));
       const main = h('div', { className: 'aav-main' }, h(Transcript, { t, state, session: selected, onRestore }));
       const body = h('div', { className: 'aav-body' }, side, main);
 
@@ -595,7 +638,7 @@ window.__ModuleLoader__.load({
         h('h2', null, t('panel.title')),
         h('span', { className: 'aav-headSub' }, t('panel.count', { shown: state.sessions.length, n: state.listTotal })),
         h('span', { className: 'aav-spacer' }),
-        h('button', { type: 'button', className: 'aav-btn', onClick: () => loadSessions({ force: true }) }, t('action.refresh')),
+        h('button', { type: 'button', className: 'aav-btn', onClick: () => { store.set({ filterDropped: false }); return loadSessions({ force: true }); } }, t('action.refresh')),
         h('button', { type: 'button', className: 'aav-btn', onClick: onClose }, t('action.close')));
 
       return h(React.Fragment, null, h('style', null, CSS), h('div', { className: 'aav-root' }, header, body));
@@ -636,7 +679,7 @@ window.__ModuleLoader__.load({
           'aria-label': label,
           title: wide ? undefined : label,
           onClick: () => {
-            store.set({ open: true });
+            store.set({ open: true, filterDropped: false });
             if (store.state.listPhase !== 'loading') loadSessions();
           }
         }, h(Icon, { size: 20 })),
@@ -784,10 +827,12 @@ window.__ModuleLoader__.load({
             'filter.workspace.ungrouped': '未分组（{n}）',
             'filter.workspace.option': '{title}（{n}）',
             'filter.unavailable': '工作区筛选需要重启 DSH 后生效',
+            'notice.filterDropped': '所选工作区已没有归档会话，已切回「全部工作区」。',
             'loading.list': '正在读取归档列表…',
             'loading.transcript': '正在读取会话正文…',
             'empty.archive': '当前没有已归档的会话',
             'empty.workspace': '该工作区没有已归档的会话',
+            'empty.grouping': '暂时读不到会话的归属工作区（宿主读取会话失败），无法按工作区筛选。',
             'empty.filtered': '没有匹配的会话',
             'empty.select': '从左侧选择一条归档会话',
             'empty.block': '（无正文）',
@@ -839,10 +884,12 @@ window.__ModuleLoader__.load({
             'filter.workspace.ungrouped': 'Ungrouped ({n})',
             'filter.workspace.option': '{title} ({n})',
             'filter.unavailable': 'Workspace filtering needs a DSH restart',
+            'notice.filterDropped': 'That workspace has no archived sessions left; switched back to all workspaces.',
             'loading.list': 'Reading the archive list…',
             'loading.transcript': 'Reading the session log…',
             'empty.archive': 'No archived sessions',
             'empty.workspace': 'No archived sessions in this workspace',
+            'empty.grouping': 'Could not read session ownership from the Host, so filtering by workspace is unavailable.',
             'empty.filtered': 'No matching sessions',
             'empty.select': 'Pick an archived session on the left',
             'empty.block': '(no content)',

@@ -130,17 +130,20 @@ export function workspacePathKey(value) {
  * registered workspace path.
  *
  * @param workspaces - registry entities (`id`, `title`, `path`, `sessionIds`).
- * @returns `{ bySession, byPath, titles }` — the two lookup tiers and a
- *   workspace-id → title map. All the work is in-memory: no I/O per session.
+ * @returns `{ bySession, byPath, titles, paths }` — the two lookup tiers plus
+ *   workspace-id → title and workspace-id → directory maps. All the work is
+ *   in-memory: no I/O per session.
  */
 export function indexWorkspaces(workspaces) {
   const bySession = new Map();
   const byPath = new Map();
   const titles = new Map();
+  const paths = new Map();
   for (const workspace of workspaces ?? []) {
     if (workspace === null || workspace === undefined) continue;
     const id = String(workspace.id);
     titles.set(id, workspace.title);
+    paths.set(id, workspace.path);
     const key = workspacePathKey(workspace.path);
     if (key !== "") {
       if (!byPath.has(key)) byPath.set(key, new Set());
@@ -152,7 +155,7 @@ export function indexWorkspaces(workspaces) {
       bySession.get(member).add(id);
     }
   }
-  return { bySession, byPath, titles };
+  return { bySession, byPath, titles, paths };
 }
 
 /**
@@ -165,12 +168,13 @@ export function indexWorkspaces(workspaces) {
  * @param sessionId - the session to place.
  * @param cwd - the session's associated directory, when known.
  * @param index - the result of {@link indexWorkspaces}.
- * @returns a Set of workspace ids; empty means "ungrouped".
+ * @returns a copy of the matching Set of workspace ids; empty means
+ *   "ungrouped". A copy, so no caller can mutate the registry index.
  */
 export function sessionWorkspaces(sessionId, cwd, index) {
   const byMembership = index?.bySession?.get(String(sessionId));
-  if (byMembership !== undefined && byMembership.size > 0) return byMembership;
-  return index?.byPath?.get(workspacePathKey(cwd)) ?? new Set();
+  if (byMembership !== undefined && byMembership.size > 0) return new Set(byMembership);
+  return new Set(index?.byPath?.get(workspacePathKey(cwd)) ?? []);
 }
 
 /** Durable artifact filenames, newest generation first. */
@@ -662,6 +666,10 @@ export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRo
     const title = workspaceIndex.titles.get(id);
     return typeof title === "string" && title.trim() !== "" ? title : id;
   };
+  const pathOf = (id) => {
+    const path = workspaceIndex.paths.get(id);
+    return typeof path === "string" ? path : "";
+  };
   spent.registryMs = mark() - started;
 
   const records = new Map();
@@ -733,14 +741,26 @@ export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRo
     for (const owner of owners) workspaceCounts.set(owner, (workspaceCounts.get(owner) ?? 0) + 1);
   }
   const workspaceOptions = [...workspaceCounts.entries()]
-    .map(([id, count]) => ({ id, title: titleOf(id), count }))
+    // `path` rides along so the reader can tell two same-titled workspaces
+    // apart in a tooltip; it is never used for matching here.
+    .map(([id, count]) => ({ id, title: titleOf(id), path: pathOf(id), count }))
     .sort((a, b) => a.title.localeCompare(b.title));
 
   // One page only: every per-session cost below (titles, folding) is bounded by
   // the page size, so latency stays flat while the archive grows. `hasMore`
   // tells the reader there is another page.
+  //
+  // The matched ids are ordered BEFORE the slice: a page must be the newest N of
+  // the matched set, not the first N of the archive set re-sorted afterwards —
+  // the latter decided by archive-set position whether a workspace's newest
+  // session appeared on page one at all (measured on the live library: the four
+  // newest sessions sat outside the first 50 archive-set positions). Both sort
+  // keys are already in memory, so this ordering costs no extra I/O: the header
+  // from the persistence read above, the artifact mtime from the directory scan.
   const pageSize = Number.isSafeInteger(page) && page > 0 ? Math.min(page, MAX_LIST_LIMIT) : DEFAULT_LIST_LIMIT;
-  const pageIds = matchedIds.slice(0, pageSize);
+  const timeOf = (id) => records.get(id)?.header?.createdAt ?? index.get(id)?.mtime ?? 0;
+  const orderedIds = [...matchedIds].sort((a, b) => timeOf(b) - timeOf(a));
+  const pageIds = orderedIds.slice(0, pageSize);
 
   // Titles, cheapest source first. Measured here: reading all 52 persisted
   // checkpoints costs ~14ms, while folding one title out of a log costs ~44ms
@@ -838,10 +858,13 @@ export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRo
   const sessions = pageIds.map(id => {
     const record = records.get(id);
     const artifact = index.get(id);
-    // The row shows the workspace the filter matched it by, so a session placed
-    // via its `cwd` is not listed as if it belonged nowhere.
+    // The row shows the workspace the filter matched it by: a session the
+    // registry accounts under several workspaces would otherwise print one the
+    // reader did not ask for. With no filter in force, the first is as good as
+    // any.
     const owners = workspacesOf(id);
-    const workspaceId = owners.size > 0 ? [...owners][0] : undefined;
+    const matchedByFilter = wanted !== "" && wanted !== "ungrouped" && owners.has(wanted);
+    const workspaceId = matchedByFilter ? wanted : (owners.size > 0 ? [...owners][0] : undefined);
     return {
       id,
       title: titles.get(id) ?? "",
@@ -859,7 +882,9 @@ export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRo
       titleSource: titles.has(id) ? (fromCache.has(id) ? "checkpoint" : "fold") : "none"
     };
   });
-  sessions.sort((a, b) => (b.createdAt ?? b.mtime ?? 0) - (a.createdAt ?? a.mtime ?? 0));
+  // `pageIds` is already newest-first (see the ordering above), so the rows need
+  // no second sort: re-sorting here would also re-introduce the trap where the
+  // displayed order and the paged order disagree.
   spent.totalMs = mark() - started;
   spent.archived = matchedIds.length;
   spent.archivedAll = archivedIds.length;
@@ -880,9 +905,14 @@ export async function listArchived({ workspaceRegistry, sessionQuery, sessionsRo
     workspace: wanted,
     workspaceOptions,
     ungroupedCount,
+    // True when the persistence read that resolves ownership failed. Every
+    // session then looks ungrouped, so a workspace filter answers "empty" for
+    // reasons that have nothing to do with the archive: the reader must say so
+    // instead of reporting an empty workspace.
+    groupingFailed: filterError !== undefined,
     hasMore: matchedIds.length > pageIds.length,
-    // Folded per page in newest-first order, so "load more" walks the archive
-    // without ever resolving more titles than the page it is showing.
+    // Every per-session cost stays bounded by the page, so "load more" walks the
+    // archive without ever resolving more titles than the page it is showing.
     timings: spent
   };
 }

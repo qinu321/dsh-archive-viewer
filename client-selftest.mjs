@@ -1,12 +1,4 @@
 /**
-
-const styleElement = wideElements.find(element => element.type === 'style');
-const styleText = String(styleElement?.props?.children ?? '');
-check('the entry injects its own stylesheet', styleText.includes('.aav-footerBtn') && styleText.length > 500, String(styleText.length));
-check('the footer button pins an explicit row height', /\.aav-footerBtn\s*\{[^}]*height:\s*32px/.test(styleText), 'no height:32px rule');
-check('the wide label is set to a single ellipsized line', /\.aav-footerLabel\s*\{[^}]*white-space:\s*nowrap/.test(styleText), 'no nowrap rule');
-check('the rail variant keeps a 36px square', /\.aav-footerBtnRail\s*\{[^}]*width:\s*36px/.test(styleText), 'no rail rule');
-/**
  * Offline client-half harness for dsh-archive-viewer.
  *
  * Loads client.js the way the browser loader does (one `__ModuleLoader__.load`
@@ -153,7 +145,7 @@ check('footer entry renders without throwing (wide)', renderError === undefined,
 const wideElements = collect(wideTree);
 const wideButtons = wideElements.filter(element => element.type === 'button');
 check('footer entry renders exactly one button', wideButtons.length === 1, String(wideButtons.length));
-check('the button carries a localized aria-label', wideButtons[0]?.props?.['aria-label'] === '归档会话查看器' || typeof wideButtons[0]?.props?.['aria-label'] === 'string',
+check('the button carries a localized aria-label', wideButtons[0]?.props?.['aria-label'] === '归档会话查看器',
   String(wideButtons[0]?.props?.['aria-label']));
 // The foot is the sidebar's most crowded strip: the entry is an icon-only
 // square in both states, and must never ask for a share of the row's width.
@@ -293,13 +285,29 @@ const defaultListResult = () => ({
   hasMore: true
 });
 let listResult = defaultListResult;
+/** When set, the next list answer is withheld until `releaseHeld()` runs — the
+ *  only way to put two list requests genuinely in flight at once. */
+let holdNextAnswer = false;
+let held = null;
+const releaseHeld = () => { const run = held; held = null; if (run !== null) run(); };
 globalThis.fetch = async (url) => {
+  const text = String(url);
   // Diagnostics posts ride the same fetch; the list assertions must ignore them.
-  if (!String(url).includes('/diagnostic')) listUrls.push(String(url));
+  const isList = !text.includes('/diagnostic');
+  if (isList) listUrls.push(text);
+  if (isList && held === null && holdNextAnswer) {
+    holdNextAnswer = false;
+    return await new Promise(resolve => {
+      held = () => resolve({
+        status: 200,
+        async json() { return { ok: true, result: listResult(text) }; }
+      });
+    });
+  }
   return {
     status: 200,
     async json() {
-      return { ok: true, result: listResult(String(url)) };
+      return { ok: true, result: listResult(text) };
     }
   };
 };
@@ -348,8 +356,8 @@ check('an answer shorter than the request does not shrink the window',
 // for one workspace, so a workspace holding more sessions than one page is
 // still reported in full — filtering the loaded page here would under-report.
 const workspaceOptions = [
-  { id: 'ws-debug', title: 'debug', count: 44 },
-  { id: 'ws-temp', title: 'temp', count: 2 }
+  { id: 'ws-debug', title: 'debug', path: 'E:\\codeVibe\\debug', count: 44 },
+  { id: 'ws-temp', title: 'temp', path: 'E:\\codeVibe\\temp', count: 2 }
 ];
 const listForWorkspace = () => ({
   sessions: [{ id: 'session-a', title: '归档的会话', titleSource: 'checkpoint', bytes: 10, createdAt: 5, workspaceId: 'ws-debug', workspaceTitle: 'debug' }],
@@ -364,7 +372,14 @@ const listForWorkspace = () => ({
 listResult = listForWorkspace;
 setProbeState({
   open: true, listPhase: 'ready', listLimit: 50, listTotal: 46, listHasMore: false, query: '',
-  sessions: [], workspaceFilter: '', workspaceOptions, ungroupedCount: 0, visibleTotal: 46, filterSupported: true
+  // The rows on screen belong to the previous query: the switch below has to
+  // REPLACE them, which an empty starting list could not tell apart from
+  // "assigned the new rows because there were none".
+  sessions: [
+    { id: 'stale-1', title: '旧行 1', titleSource: 'checkpoint' },
+    { id: 'stale-2', title: '旧行 2', titleSource: 'checkpoint' }
+  ],
+  workspaceFilter: '', workspaceOptions, ungroupedCount: 0, visibleTotal: 46, filterSupported: true, filterDropped: false
 });
 
 const panelElements = renderPanel();
@@ -373,13 +388,20 @@ const inputIndex = panelElements.findIndex(element => element.type === 'input');
 check('the panel renders a workspace selector', selectIndex !== -1, 'no select element');
 check('the selector sits above the search box', selectIndex !== -1 && inputIndex !== -1 && selectIndex < inputIndex,
   `select@${selectIndex} input@${inputIndex}`);
-const optionLabels = panelElements.filter(element => element.type === 'option').map(element => element.props?.children);
+const optionElements = panelElements.filter(element => element.type === 'option');
+const optionLabels = optionElements.map(element => element.props?.children);
 check('the "all workspaces" entry carries the visible archive size',
   optionLabels.includes('全部工作区（46）'), JSON.stringify(optionLabels));
 check('every workspace holding archived sessions is offered with its count',
   optionLabels.includes('debug（44）') && optionLabels.includes('temp（2）'), JSON.stringify(optionLabels));
 check('no ungrouped entry when every session is accounted for',
   !optionLabels.some(label => String(label).startsWith('未分组')), JSON.stringify(optionLabels));
+check('a workspace option is tooltipped with its directory, not its id',
+  optionElements.find(element => element.props?.value === 'ws-debug')?.props?.title === 'E:\\codeVibe\\debug',
+  JSON.stringify(optionElements.map(element => [element.props?.value, element.props?.title])));
+check('the selector takes its accessible name from the visible label',
+  panelElements.find(element => element.type === 'select')?.props?.['aria-label'] === undefined,
+  String(panelElements.find(element => element.type === 'select')?.props?.['aria-label']));
 
 const beforeSwitch = listUrls.length;
 const select = panelElements.find(element => element.type === 'select');
@@ -402,9 +424,54 @@ check('clearing the selector asks for the whole archive again',
   listUrls[beforeAll] === '/archive-viewer/api/sessions?limit=50', String(listUrls[beforeAll]));
 check('the cleared choice is stored as "all"', probeInstance.__state.workspaceFilter === '', String(probeInstance.__state.workspaceFilter));
 
+// --- 5h. an older answer must not overwrite a newer choice ------------------
+// The selector fires a request per change, so two answers can be in flight at
+// once. Without a generation guard the slower (older) one lands last and puts
+// the screen back on the workspace the user already left.
+const rowsFor = (workspace, id) => ({
+  sessions: [{ id, title: workspace, titleSource: 'checkpoint' }],
+  total: 1, archivedCount: 1, visibleTotal: 46, workspace, workspaceOptions, ungroupedCount: 0, hasMore: false
+});
+listResult = (url) => (url.includes('workspace=ws-debug') ? rowsFor('ws-debug', 'session-debug') : rowsFor('ws-temp', 'session-temp'));
+setProbeState({ workspaceFilter: '', filterSupported: true, listPhase: 'ready', sessions: [], listTotal: 0, filterDropped: false });
+holdNextAnswer = true;
+const slowSwitch = renderPanel().find(element => element.type === 'select').props.onChange({ target: { value: 'ws-debug' } });
+const fastSwitch = renderPanel().find(element => element.type === 'select').props.onChange({ target: { value: 'ws-temp' } });
+await fastSwitch;
+check('the newest request paints while an older answer is still in flight',
+  probeInstance.__state.workspaceFilter === 'ws-temp' && probeInstance.__state.sessions[0]?.id === 'session-temp',
+  JSON.stringify([probeInstance.__state.workspaceFilter, probeInstance.__state.sessions.map(session => session.id)]));
+releaseHeld();
+await slowSwitch;
+check('a superseded answer cannot overwrite the newest choice',
+  probeInstance.__state.workspaceFilter === 'ws-temp' && probeInstance.__state.sessions[0]?.id === 'session-temp',
+  JSON.stringify([probeInstance.__state.workspaceFilter, probeInstance.__state.sessions.map(session => session.id)]));
+
+// --- 5i. a failed list must not keep the previous query's rows --------------
+// Rows left on screen under a newly chosen workspace claim "this workspace
+// holds these sessions", which is exactly what the failure just disproved.
+setProbeState({
+  workspaceFilter: 'ws-debug', filterSupported: true, listPhase: 'ready', listTotal: 44,
+  sessions: [{ id: 'stale-row', title: '旧行', titleSource: 'checkpoint' }],
+  workspaceOptions, ungroupedCount: 0, visibleTotal: 46, filterDropped: false
+});
+listResult = () => { throw new Error('宿主读列表失败'); };
+await renderPanel().find(element => element.type === 'select').props.onChange({ target: { value: 'ws-boom' } });
+check('a failed list reports the error and drops the previous rows',
+  probeInstance.__state.listPhase === 'error' && probeInstance.__state.sessions.length === 0 && probeInstance.__state.listTotal === 0,
+  JSON.stringify({ phase: probeInstance.__state.listPhase, rows: probeInstance.__state.sessions.length, total: probeInstance.__state.listTotal }));
+const failedElements = renderPanel();
+check('a failed list shows the error instead of rows',
+  failedElements.some(element => String(element.props?.className ?? '') === 'aav-empty aav-err')
+  && !failedElements.some(element => String(element.props?.children ?? '').includes('旧行')),
+  JSON.stringify(failedElements.filter(element => String(element.props?.children ?? '').includes('旧行')).length));
+check('the options survive a failure, so the reader can switch away',
+  probeInstance.__state.workspaceOptions.length === 2, String(probeInstance.__state.workspaceOptions.length));
+
 // A workspace that loses its last archived session (restored elsewhere while
 // the panel is open) must not strand the list on an empty page: the selection
-// falls back to "all" once, without asking repeatedly.
+// falls back to "all" once, without asking repeatedly — and says so, because a
+// selection that clears itself silently reads as a bug.
 let staleUrls = 0;
 listResult = (url) => {
   const asked = /workspace=([^&]+)/.exec(url);
@@ -415,7 +482,7 @@ listResult = (url) => {
   };
 };
 const beforeStale = listUrls.length;
-setProbeState({ workspaceFilter: 'ws-debug', filterSupported: true });
+setProbeState({ workspaceFilter: 'ws-debug', filterSupported: true, listPhase: 'ready', sessions: [], listTotal: 0, filterDropped: false });
 await clickByText('刷新');
 staleUrls = listUrls.length - beforeStale;
 check('a workspace whose sessions are gone falls back to the whole archive',
@@ -424,6 +491,12 @@ check('a workspace whose sessions are gone falls back to the whole archive',
   JSON.stringify(listUrls.slice(beforeStale)));
 check('the fallback is asked for once, not in a loop', staleUrls === 2, String(staleUrls));
 check('the store drops the stale choice', probeInstance.__state.workspaceFilter === '', String(probeInstance.__state.workspaceFilter));
+check('the dropped selection is flagged for the reader',
+  probeInstance.__state.filterDropped === true, String(probeInstance.__state.filterDropped));
+const droppedElements = renderPanel();
+check('the dropped selection is stated in the sidebar, not applied silently',
+  droppedElements.some(element => element.props?.children === '所选工作区已没有归档会话，已切回「全部工作区」。'),
+  JSON.stringify(droppedElements.filter(element => String(element.props?.children ?? '').includes('工作区')).map(element => element.props.children).slice(0, 4)));
 
 // An older Host neither understands `workspace=` nor echoes it. Showing the
 // selector then would advertise a filter that is not in force, so the panel
@@ -435,18 +508,42 @@ const noticeElements = renderPanel();
 check('the selector is replaced by a restart notice',
   !noticeElements.some(element => element.type === 'select')
   && noticeElements.some(element => String(element.props?.className ?? '') === 'aav-fieldNote'
-    && String(element.props?.children ?? '').includes('重启')),
+    && element.props?.children === '工作区筛选需要重启 DSH 后生效'),
   JSON.stringify(noticeElements.filter(element => String(element.props?.className ?? '') === 'aav-fieldNote').map(element => element.props.children)));
+
+// When the Host cannot resolve ownership at all, an empty answer for a chosen
+// workspace means "cannot tell", not "nothing there": the selection must stay
+// put and the reader must be told what actually failed.
+setProbeState({
+  workspaceFilter: 'ws-debug', filterSupported: true, listPhase: 'ready', listTotal: 0,
+  sessions: [], groupingFailed: false, filterDropped: false, workspaceOptions, visibleTotal: 46
+});
+listResult = () => ({
+  sessions: [], total: 0, archivedCount: 0, visibleTotal: 0, hasMore: false,
+  workspace: 'ws-debug', workspaceOptions: [], ungroupedCount: 0, groupingFailed: true
+});
+const beforeGrouping = listUrls.length;
+await clickByText('刷新');
+check('an unreadable ownership table keeps the choice and asks exactly once',
+  probeInstance.__state.groupingFailed === true && probeInstance.__state.workspaceFilter === 'ws-debug'
+  && listUrls.length === beforeGrouping + 1,
+  JSON.stringify({ failed: probeInstance.__state.groupingFailed, filter: probeInstance.__state.workspaceFilter, requests: listUrls.length - beforeGrouping }));
+const groupingElements = renderPanel();
+check('an unreadable ownership table is not reported as an empty workspace',
+  groupingElements.some(element => String(element.props?.className ?? '') === 'aav-empty'
+    && element.props?.children === '暂时读不到会话的归属工作区（宿主读取会话失败），无法按工作区筛选。'),
+  JSON.stringify(groupingElements.filter(element => String(element.props?.className ?? '') === 'aav-empty').map(element => element.props.children)));
+listResult = () => ({ sessions: [], total: 0, archivedCount: 0, hasMore: false });
 
 // The empty state has to name what is actually empty: a chosen workspace with
 // no archived session is not the same as an empty archive.
-setProbeState({ filterSupported: true, workspaceFilter: 'ws-gone', listTotal: 0, listPhase: 'ready', sessions: [], query: '' });
+setProbeState({ filterSupported: true, workspaceFilter: 'ws-gone', listTotal: 0, listPhase: 'ready', sessions: [], query: '', filterDropped: false, groupingFailed: false });
 const emptyElements = renderPanel();
 check('an empty workspace says so instead of claiming the archive is empty',
   emptyElements.some(element => String(element.props?.className ?? '') === 'aav-empty'
     && element.props?.children === '该工作区没有已归档的会话'),
   JSON.stringify(emptyElements.filter(element => String(element.props?.className ?? '') === 'aav-empty').map(element => element.props.children)));
-setProbeState({ open: false, listHasMore: false, workspaceFilter: '', sessions: [], listTotal: 0, query: '' });
+setProbeState({ open: false, listHasMore: false, workspaceFilter: '', sessions: [], listTotal: 0, query: '', filterDropped: false });
 
 // --- 6. diagnostics channel ----------------------------------------------
 const posted = [];

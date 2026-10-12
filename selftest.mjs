@@ -272,7 +272,8 @@ check("GET /sessions accepts a workspace filter",
   routeFiltered.status === 200 && routeFiltered.payload.result.sessions.length === 1
   && routeFiltered.payload.result.workspace === "ws-1", JSON.stringify(routeFiltered.payload.result.workspace));
 check("the filtered list carries the workspace options",
-  JSON.stringify(routeFiltered.payload.result.workspaceOptions) === JSON.stringify([{ id: "ws-1", title: "调试工作区", count: 1 }]),
+  JSON.stringify(routeFiltered.payload.result.workspaceOptions.map(option => [option.id, option.title, option.count]))
+  === JSON.stringify([["ws-1", "调试工作区", 1]]),
   JSON.stringify(routeFiltered.payload.result.workspaceOptions));
 const routeUnmatched = await call(`${API_PREFIX}/sessions?workspace=ws-other`);
 check("a workspace with no archived session answers with an empty list",
@@ -569,8 +570,11 @@ check("with no filter every session is listed", everything.sessions.length === 4
 check("the unfiltered size is reported next to it", everything.visibleTotal === 4, String(everything.visibleTotal));
 check("the applied filter is echoed as empty", everything.workspace === "", JSON.stringify(everything.workspace));
 check("the options count each workspace's archived sessions",
-  JSON.stringify(everything.workspaceOptions) === JSON.stringify([{ id: "ws-debug", title: "debug", count: 2 }, { id: "ws-temp", title: "temp", count: 1 }]),
+  JSON.stringify(everything.workspaceOptions.map(option => [option.id, option.title, option.count]))
+  === JSON.stringify([["ws-debug", "debug", 2], ["ws-temp", "temp", 1]]),
   JSON.stringify(everything.workspaceOptions));
+check("an option carries the workspace directory, for disambiguating same-titled workspaces",
+  everything.workspaceOptions[0].path === "E:\\codeVibe\\debug", JSON.stringify(everything.workspaceOptions.map(option => option.path)));
 check("sessions no workspace accounts for are counted as ungrouped", everything.ungroupedCount === 1, String(everything.ungroupedCount));
 check("a session placed by its cwd shows the workspace it matched",
   everything.sessions.find(session => session.id === "session-old")?.workspaceTitle === "temp",
@@ -671,6 +675,134 @@ check("a workspace with no title is labelled by its id",
   untitled.workspaceOptions.length === 1 && untitled.workspaceOptions[0].title === "ws-debug",
   JSON.stringify(untitled.workspaceOptions));
 
+// A page must be the newest N of the MATCHED set, not the first N of the
+// archive set re-sorted afterwards: with the latter, a workspace holding more
+// sessions than one page hid its own newest sessions behind "load more"
+// (measured on the live library: the newest four sat outside the first 50
+// archive-set positions). The archive-set order below deliberately puts the
+// newest session LAST.
+const orderIds = ["session-oldest", "session-middle", "session-newest"];
+const orderCreatedAt = { "session-oldest": 100, "session-middle": 200, "session-newest": 300 };
+const orderArtifacts = new Map(orderIds.map((id, index) => [id, { path: id, bytes: 10, mtime: 10 + index, project: "p" }]));
+const orderRegistry = {
+  archivedSessionIds: orderIds,
+  list: () => [{ id: "ws-debug", title: "debug", path: "E:\\codeVibe\\debug", sessionIds: [...orderIds] }]
+};
+const orderQuery = {
+  ...fakeCtx.sessionQuery,
+  filterSessions: async (filters) => (filters[0]?.values ?? []).map(id => ({
+    header: { id, cwd: "E:\\codeVibe\\debug", createdAt: orderCreatedAt[id], version: 4, isSeeded: false }, live: false, persisted: true
+  })),
+  readTitleSnapshots: async (ids) => ids.map(id => ({ sessionId: id, status: "fulfilled", value: { title: { title: `t-${id}` } } }))
+};
+const orderedPage = await listArchived({
+  workspaceRegistry: orderRegistry,
+  sessionQuery: orderQuery,
+  sessionsRoot: "unused",
+  artifactIndex: orderArtifacts,
+  titleCache: new Map(),
+  projectionCache: undefined,
+  excludedPaths: configExcludedPaths({}),
+  workspaceFilter: "ws-debug",
+  page: 2
+});
+check("a page holds the newest sessions of the filtered set, not the first in archive-set order",
+  JSON.stringify(orderedPage.sessions.map(session => session.id)) === JSON.stringify(["session-newest", "session-middle"]),
+  JSON.stringify(orderedPage.sessions.map(session => session.id)));
+check("the page still reports that more sessions exist", orderedPage.hasMore === true && orderedPage.total === 3);
+
+// A session the registry accounts under two workspaces: the options count it in
+// both (each option answers "how many rows will I see if I pick this"), so the
+// counts need not sum to the archive total — and the row has to name the
+// workspace the filter matched, not an arbitrary one.
+const dualIds = ["session-both", "session-nowhere"];
+const dualRegistry = {
+  archivedSessionIds: dualIds,
+  list: () => [
+    { id: "ws-a", title: "A", path: "E:\\a", sessionIds: ["session-both"] },
+    { id: "ws-b", title: "B", path: "E:\\b", sessionIds: ["session-both"] }
+  ]
+};
+const dualQuery = {
+  ...fakeCtx.sessionQuery,
+  filterSessions: async (filters) => (filters[0]?.values ?? []).map(id => ({
+    header: { id, cwd: "E:\\nowhere", createdAt: 100, version: 4, isSeeded: false }, live: false, persisted: true
+  })),
+  readTitleSnapshots: async (ids) => ids.map(id => ({ sessionId: id, status: "fulfilled", value: { title: { title: `t-${id}` } } }))
+};
+const dual = await listArchived({
+  workspaceRegistry: dualRegistry,
+  sessionQuery: dualQuery,
+  sessionsRoot: "unused",
+  artifactIndex: new Map(dualIds.map(id => [id, { path: id, bytes: 10, mtime: 5, project: "p" }])),
+  titleCache: new Map(),
+  projectionCache: undefined,
+  excludedPaths: configExcludedPaths({})
+});
+check("a session owned twice is counted under both workspaces",
+  JSON.stringify(dual.workspaceOptions.map(option => [option.id, option.count])) === JSON.stringify([["ws-a", 1], ["ws-b", 1]]),
+  JSON.stringify(dual.workspaceOptions));
+check("the counted rows therefore need not sum to the archive total",
+  dual.visibleTotal === 2 && dual.ungroupedCount === 1
+  && dual.workspaceOptions.reduce((sum, option) => sum + option.count, 0) + dual.ungroupedCount === 3,
+  JSON.stringify({ options: dual.workspaceOptions, ungrouped: dual.ungroupedCount, visible: dual.visibleTotal }));
+const dualFiltered = await listArchived({
+  workspaceRegistry: dualRegistry,
+  sessionQuery: dualQuery,
+  sessionsRoot: "unused",
+  artifactIndex: new Map(dualIds.map(id => [id, { path: id, bytes: 10, mtime: 5, project: "p" }])),
+  titleCache: new Map(),
+  projectionCache: undefined,
+  excludedPaths: configExcludedPaths({}),
+  workspaceFilter: "ws-b"
+});
+check("a multi-owned row names the workspace the filter matched, not the first one",
+  dualFiltered.sessions.length === 1 && dualFiltered.sessions[0].workspaceId === "ws-b" && dualFiltered.sessions[0].workspaceTitle === "B",
+  JSON.stringify(dualFiltered.sessions.map(session => [session.id, session.workspaceId, session.workspaceTitle])));
+
+// When the persistence read that resolves ownership fails, every session looks
+// ungrouped: the response must say so, or a filtered "nothing" reads as an
+// empty workspace while the reader knows it holds dozens of sessions.
+const brokenOwnership = await listArchived({
+  workspaceRegistry: dualRegistry,
+  sessionQuery: { ...dualQuery, filterSessions: async () => { throw new Error("db down"); } },
+  sessionsRoot: "unused",
+  artifactIndex: new Map(dualIds.map(id => [id, { path: id, bytes: 10, mtime: 5, project: "p" }])),
+  titleCache: new Map(),
+  projectionCache: undefined,
+  excludedPaths: configExcludedPaths({}),
+  workspaceFilter: "ws-a"
+});
+check("a failed ownership read is reported, not disguised as an empty workspace",
+  brokenOwnership.groupingFailed === true && brokenOwnership.total === 1,
+  JSON.stringify({ failed: brokenOwnership.groupingFailed, total: brokenOwnership.total }));
+check("a failed ownership read still places sessions the registry accounts for (membership needs no header)",
+  brokenOwnership.sessions.length === 1 && brokenOwnership.sessions[0].id === "session-both",
+  JSON.stringify(brokenOwnership.sessions.map(session => session.id)));
+check("the same list without a filter still reports the failure",
+  (await listArchived({
+    workspaceRegistry: dualRegistry,
+    sessionQuery: { ...dualQuery, filterSessions: async () => { throw new Error("db down"); } },
+    sessionsRoot: "unused",
+    artifactIndex: new Map(dualIds.map(id => [id, { path: id, bytes: 10, mtime: 5, project: "p" }])),
+    titleCache: new Map(),
+    projectionCache: undefined,
+    excludedPaths: configExcludedPaths({})
+  })).groupingFailed === true);
+check("a healthy list does not claim a failure",
+  dual.groupingFailed === false && orderedPage.groupingFailed === false, JSON.stringify([dual.groupingFailed, orderedPage.groupingFailed]));
+
+// The workspace index is shared state for the duration of one request: a caller
+// must not be able to mutate it through a returned Set.
+const isolationIndex = indexWorkspaces([{ id: "ws-a", title: "A", path: "E:\\a", sessionIds: ["session-x"] }]);
+sessionWorkspaces("session-x", undefined, isolationIndex).add("POISON");
+check("resolving a session returns a copy, so the index cannot be mutated",
+  sessionWorkspaces("session-x", undefined, isolationIndex).size === 1
+  && !sessionWorkspaces("session-x", undefined, isolationIndex).has("POISON"),
+  JSON.stringify([...sessionWorkspaces("session-x", undefined, isolationIndex)]));
+check("the path tier is a copy too",
+  sessionWorkspaces("session-y", "E:\\a", isolationIndex).size === 1);
+
 // --- 6. client artifact ---------------------------------------------------
 const clientSource = readFileSync(new URL("./client.js", import.meta.url), "utf8");
 check("client registers through the module loader", clientSource.includes("__ModuleLoader__.load"));
@@ -723,6 +855,9 @@ if (process.env.ARCHIVE_VIEWER_LIVE === "1") {
       check("live: every visible session is accounted for by an option",
         live.workspaceOptions.reduce((total, option) => total + option.count, 0) + live.ungroupedCount === live.visibleTotal,
         JSON.stringify({ options: live.workspaceOptions, ungrouped: live.ungroupedCount, visible: live.visibleTotal }));
+      check("live: this library resolves to at least one workspace (the cwd tier is not what is being exercised)",
+        live.workspaceOptions.length > 0,
+        `options=${live.workspaceOptions.length} ungrouped=${live.ungroupedCount} visible=${live.visibleTotal}`);
       for (const option of live.workspaceOptions.slice(0, 3)) {
         const only = await liveCall(`${API_PREFIX}/sessions?workspace=${encodeURIComponent(option.id)}&limit=500`);
         check(`live: "${option.title}" is filtered to its own sessions`,
