@@ -405,6 +405,10 @@ window.__ModuleLoader__.load({
 .aav-badge { padding: 1px 6px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 999px; font-size: 10.5px;
   color: var(--dsw-alias-label-secondary); }
 .aav-injected { opacity: .72; }
+/* A compaction boundary: it is a system event, so it reads quieter than a
+   message but stays distinct from the injected-context rows. */
+.aav-compaction { border-color: var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-1); }
+.aav-compaction .aav-msgHead { color: var(--dsw-alias-label-primary); }
 .aav-turn { margin: 16px 0 10px; font-size: 11px; color: var(--dsw-alias-label-secondary); }
 .aav-pre { margin: 0; padding: 8px 10px; background: var(--dsw-alias-bg-base); border-top: 1px solid var(--dsw-alias-border-l1);
   white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; max-height: 420px; overflow: auto; }
@@ -414,27 +418,43 @@ window.__ModuleLoader__.load({
 .aav-rowAction { text-align: center; font-size: 11.5px; color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); }
 .aav-loadMore { text-align: center; color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); }
 .aav-empty { padding: 24px; color: var(--dsw-alias-label-secondary); text-align: center; }
-/* Footer entry geometry. Deliberately an icon-only square in BOTH sidebar
-   states: the foot is the sidebar's most crowded strip (memory plugin +
-   session manager + this entry), and a full-width row here pushes entries
-   past the column edge. Measured evidence for the original failure: the
-   button rendered at 31x145px because its stylesheet had not mounted at all,
-   and the row itself overflows whenever any entry asks for more width. */
+/* Footer entry: the shipped shape — a full-width row with an icon AND its
+   label when the sidebar is expanded, and the same icon alone when it is
+   collapsed to the rail. A lone glyph was not self-explanatory; the label is
+   what names the panel. The footer wraps (see the :has rule below), so the row
+   takes its own line instead of squeezing the neighbouring entries. */
 .aav-footerBtn { display: inline-flex; box-sizing: border-box; align-items: center; justify-content: center;
   /* A stacking escape hatch: measured on this machine the footer row is
      264px + 33px + 40px wide inside a 280px column, so the last entry can be
      painted under a sibling or clipped. Raising the z-index keeps this entry
      clickable without changing the row's layout. */
   position: relative; z-index: 5;
-  width: 40px; min-width: 40px; max-width: 40px; height: 40px; padding: 0; margin: 0;
-  font: inherit; font-size: 13px; line-height: 1; white-space: nowrap; overflow: hidden;
+  font: inherit; white-space: nowrap; overflow: hidden;
   /* Tertiary label colour matches the quieter glyphs of the shipped foot
      controls; the fallback keeps the icon visible if a future theme renames
      the token instead of silently inheriting an invisible colour. */
   color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary, currentColor)); background: transparent;
-  border: none; border-radius: 8px; cursor: pointer; }
-.aav-footerBtn:hover { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
-.aav-footerBtnRail, .aav-footerBtnWide { width: 40px; min-width: 40px; max-width: 40px; height: 40px; padding: 0; }
+  border: none; cursor: pointer; }
+.aav-footerBtn:hover, .aav-footerBtn:focus-visible { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
+
+/* Collapsed sidebar: no room for text, so the entry is a square glyph. */
+.aav-footerBtnRail { width: 40px; min-width: 40px; max-width: 40px; height: 40px; padding: 0; margin: 0;
+  border-radius: 8px; font-size: 13px; line-height: 1; }
+
+/* Expanded sidebar: icon + label on one full-width row. The label ellipsizes
+   rather than widening the column, and the geometry mirrors the shipped
+   session-manager entry so both read as the same kind of control. */
+.aav-footerBtnWide { flex: 1 1 100%; width: calc(100% + 8px); height: 34px; margin: 4px -4px;
+  padding: 6px 10px; gap: 8px; justify-content: flex-start; border-radius: 12px;
+  font-size: 14px; line-height: 22px; }
+.aav-footerBtnLabel { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+
+/* A full-row entry needs the footer to wrap into lines; the shipped entries
+   declare the same rule, this copy keeps the row sane on a profile where only
+   this plugin is installed. */
+[class*=footerActions]:has(.aav-footerBtnWide), [class*=footer-actions]:has(.aav-footerBtnWide),
+[class*=footer]:has(> .aav-footerBtnWide), [class*=footer] > div:has(> .aav-footerBtnWide) {
+  flex-wrap: wrap; align-content: flex-start; height: auto; }
 `;
 
     /** Icon: an archive box with a magnifier — "read the archive". */
@@ -463,6 +483,26 @@ window.__ModuleLoader__.load({
       }
       if (item.kind === 'title') {
         return h('div', { className: 'aav-turn' }, t('title.row', { title: item.text }));
+      }
+      // A compaction is not a message the user typed: it is the summary DSH
+      // wrote into the model context in place of an earlier span. The span
+      // itself stays in the log above, so this card explains the boundary
+      // instead of pretending to be a prompt.
+      if (item.kind === 'compaction') {
+        const head = [
+          t('compaction.label'),
+          item.time ? formatTime(item.time) : '',
+          item.shadowed ? t('compaction.shadowed', { n: item.shadowed }) : '',
+          item.provider || ''
+        ].filter(Boolean).join(' · ');
+        return h('div', { className: 'aav-msg aav-compaction' },
+          h('div', { className: 'aav-msgHead' }, head),
+          h('div', { className: 'aav-msgBody' }, t('compaction.note')),
+          item.text
+            ? h('details', { className: 'aav-compactionDetails' },
+                h('summary', { className: 'aav-summary' }, t('compaction.show')),
+                h('pre', { className: 'aav-pre' }, item.text))
+            : h('div', { className: 'aav-msgBody' }, t('compaction.empty')));
       }
       // The header carries the tool name as its own badge: the whole point of
       // a tool row is knowing WHICH tool ran, so it must not be buried in a
@@ -552,7 +592,6 @@ window.__ModuleLoader__.load({
         h('div', { className: 'aav-rowMeta' }, transcript.sessionId));
       const notices = [];
       if (transcript.truncated) notices.push(h('div', { key: 'truncated', className: 'aav-banner' }, t('notice.truncated', { n: transcript.rowCount })));
-      if (transcript.surfaceAvailable === false) notices.push(h('div', { key: 'raw', className: 'aav-banner' }, t('notice.raw')));
       const all = transcript.items || [];
       const injectedRows = all.filter(item => item.kind === 'injected').length;
       const items = state.hideInjected ? all.filter(item => item.kind !== 'injected') : all;
@@ -818,7 +857,8 @@ window.__ModuleLoader__.load({
             // snapshots and asks the Host once for the metadata it lacks.
             store.set({ open: true, filterDropped: false });
           }
-        }, h(Icon, { size: 20 })),
+        }, h(Icon, { size: wide ? 16 : 20 }),
+          wide ? h('span', { className: 'aav-footerBtnLabel' }, label) : null),
         h(Dialog, { t, onRestore: props.onRestore }));
     }
 
@@ -926,7 +966,8 @@ window.__ModuleLoader__.load({
             onClick: () => {
               store.set({ open: true, filterDropped: false });
             }
-          }, h(Icon, { size: 20 })));
+          }, h(Icon, { size: wide ? 16 : 20 }),
+            wide ? h('span', { className: 'aav-footerBtnLabel' }, label) : null));
       }
     }
 
@@ -959,7 +1000,7 @@ window.__ModuleLoader__.load({
         const dictionaries = {
           zh: {
             'panel.title': '归档会话查看器',
-            'footer.label': '归档会话查看器',
+            'footer.label': '查看归档',
             'panel.count': '已列出 {shown} / 共 {n} 条',
             'panel.hidden': '已隐藏 {n} 条内部会话（记忆中枢等自动会话）',
             'action.refresh': '刷新',
@@ -992,8 +1033,12 @@ window.__ModuleLoader__.load({
             'badge.interrupted': '被打断',
             'banner.readonly': '归档状态未被改动，此视图不写入任何会话状态。',
             'notice.truncated': '仅显示最近 {n} 条记录，更早的内容未在此视图加载。',
-            'notice.raw': '未能读取当前会话面，以下为原始日志视图。',
             'notice.injectedHidden': '已隐藏 {n} 条注入上下文（系统提示、运行时快照、技能目录等）。',
+            'compaction.label': '上下文压缩',
+            'compaction.shadowed': '折叠了 {n} 条更早的记录',
+            'compaction.show': '查看压缩摘要',
+            'compaction.note': '这是当时写进模型上下文的压缩摘要，用来替代更早的一段对话；被替代的原文仍按原样保留在上方。',
+            'compaction.empty': '（这次压缩没有留下摘要文本）',
             'role.user': '用户',
             'role.assistant': '助手',
             'role.tool': '工具 · {name}',
@@ -1014,7 +1059,7 @@ window.__ModuleLoader__.load({
           },
           en: {
             'panel.title': 'Archived session viewer',
-            'footer.label': 'Archived sessions',
+            'footer.label': 'View archive',
             'panel.count': '{shown} of {n} listed',
             'panel.hidden': 'Hid {n} internal sessions (auto-created workbench sessions)',
             'action.refresh': 'Refresh',
@@ -1047,8 +1092,12 @@ window.__ModuleLoader__.load({
             'badge.interrupted': 'interrupted',
             'banner.readonly': 'Archive state untouched; this view writes no session state.',
             'notice.truncated': 'Showing the {n} most recent rows; earlier content is not loaded here.',
-            'notice.raw': 'The current session surface could not be read; showing the raw log.',
             'notice.injectedHidden': 'Hid {n} injected-context rows (system prompt, runtime snapshot, skill catalog).',
+            'compaction.label': 'Context compaction',
+            'compaction.shadowed': 'folded {n} earlier records',
+            'compaction.show': 'Show the compaction summary',
+            'compaction.note': 'This is the summary DSH wrote into the model context in place of an earlier span; those original messages are kept above, verbatim.',
+            'compaction.empty': '(this compaction left no summary text)',
             'role.user': 'User',
             'role.assistant': 'Assistant',
             'role.tool': 'Tool · {name}',

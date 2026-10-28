@@ -161,34 +161,37 @@ check('footer entry renders without throwing (wide)', renderError === undefined,
 const wideElements = collect(wideTree);
 const wideButtons = wideElements.filter(element => element.type === 'button');
 check('footer entry renders exactly one button', wideButtons.length === 1, String(wideButtons.length));
-check('the button carries a localized aria-label', wideButtons[0]?.props?.['aria-label'] === '归档会话查看器',
+check('the button carries the localized label', wideButtons[0]?.props?.['aria-label'] === '查看归档',
   String(wideButtons[0]?.props?.['aria-label']));
-// The foot is the sidebar's most crowded strip: the entry is an icon-only
-// square in both states, and must never ask for a share of the row's width.
-check('the button carries no text and no label span', (() => {
-  // The foot is the sidebar's most crowded strip, so the entry must not ask
-  // for a share of the row width: exactly one icon child, no text node.
+// A lone glyph was not self-explanatory: the expanded sidebar entry pairs the
+// icon with the panel name, while the collapsed rail has no room for text.
+check('the wide entry pairs its glyph with a visible label', (() => {
   const kids = wideButtons[0]?.props?.children;
   const list = Array.isArray(kids) ? kids : [kids];
-  return list.length === 1 && typeof list[0] === 'object' && list[0] !== null;
-})(), JSON.stringify(wideButtons[0]?.props?.children).slice(0, 120));
-check('the wide state renders no text label', !wideElements.some(element => element.type === 'span'
-  && (element.props?.children === '归档会话查看器' || (Array.isArray(element.props?.children) && element.props.children.includes('归档会话查看器')))),
-  'a label span is still rendered');
+  const labels = list.filter(child => child !== null && typeof child === 'object' && String(child.props?.className ?? '') === 'aav-footerBtnLabel');
+  return labels.length === 1 && labels[0].props?.children === '查看归档';
+})(), JSON.stringify(wideButtons[0]?.props?.children).slice(0, 160));
+check('the wide entry carries the wide-row class',
+  String(wideButtons[0]?.props?.className ?? '').includes('aav-footerBtnWide'),
+  String(wideButtons[0]?.props?.className));
 check('the entry renders a dialog element', wideElements.some(element => element.type === 'dialog'));
 const styleElement = wideElements.find(element => element.type === 'style');
 const styleText = String(styleElement?.props?.children ?? '');
 check('the entry injects its own stylesheet', styleText.includes('.aav-footerBtn') && styleText.length > 500, String(styleText.length));
-check('the footer button pins its own 40px square', /\.aav-footerBtn\s*\{[^}]*width:\s*40px[^}]*height:\s*40px/.test(styleText), 'no 40px square rule');
-check('the footer button cannot be squeezed or stretched', /\.aav-footerBtn\s*\{[^}]*min-width:\s*40px[^}]*max-width:\s*40px/.test(styleText), 'no min/max-width clamp');
-check('both sidebar states keep the same square', /\.aav-footerBtnRail,\s*\.aav-footerBtnWide\s*\{[^}]*width:\s*40px/.test(styleText), 'no shared rail/wide rule');
+check('the rail entry keeps its 40px square', /\.aav-footerBtnRail\s*\{[^}]*width:\s*40px[^}]*height:\s*40px/.test(styleText), 'no 40px rail rule');
+check('the wide entry takes a full row and ellipsizes its label',
+  /\.aav-footerBtnWide\s*\{[^}]*flex:\s*1 1 100%/.test(styleText)
+  && /\.aav-footerBtnLabel\s*\{[^}]*text-overflow:\s*ellipsis/.test(styleText),
+  'no full-row or ellipsis rule');
+check('a full-row entry makes the footer wrap instead of squeezing its siblings',
+  /:has\(\.aav-footerBtnWide\)/.test(styleText), 'no footer wrap rule');
 check('the glyph colour follows the host tertiary label token with a fallback',
   /\.aav-footerBtn\s*\{[^}]*color:\s*var\(--dsw-alias-label-tertiary,\s*var\(--dsw-alias-label-secondary,\s*currentColor\)\)/.test(styleText),
   'tertiary token or its fallback is missing');
-check('the glyph is drawn at 20px', (() => {
+check('the wide glyph is drawn slightly smaller than the rail to leave room for the label', (() => {
   // Read the size off the rendered icon element, not the source constant.
   const icons = wideElements.filter(element => element.type !== 'button' && element.props !== undefined && element.props.viewBox === '0 0 24 24');
-  return icons.some(icon => icon.props.width === 20 && icon.props.height === 20);
+  return icons.some(icon => icon.props.width === 16 && icon.props.height === 16);
 })(), JSON.stringify(wideElements.filter(element => element.props?.viewBox === '0 0 24 24').map(element => element.props?.width)));
 check('the button geometry is box-sizing-safe', /\.aav-footerBtn\s*\{[^}]*box-sizing:\s*border-box/.test(styleText), 'no border-box rule');
 // Windows' "hide scroll bars" setting leaves both panes without a position
@@ -203,8 +206,19 @@ check('the scrollable panes reserve a stable gutter',
   /\.aav-list,\s*\.aav-flow,\s*\.aav-pre\s*\{\s*scrollbar-gutter:\s*stable/.test(styleText), 'no stable gutter');
 
 let railError;
-try { slotRegistration.component({ ...ownerProps, wide: false }); } catch (error) { railError = error; }
+let railElements;
+try { railElements = collect(slotRegistration.component({ ...ownerProps, wide: false })); } catch (error) { railError = error; }
 check('footer entry renders without throwing (rail)', railError === undefined, railError === undefined ? undefined : String(railError.message));
+const railButtons = (railElements ?? []).filter(element => element.type === 'button');
+check('the rail entry is glyph-only and keeps the label as its tooltip',
+  railButtons.length === 1
+  && (Array.isArray(railButtons[0]?.props?.children) ? railButtons[0].props.children : [railButtons[0]?.props?.children])
+    .every(child => String(child?.props?.className ?? '') !== 'aav-footerBtnLabel')
+  && railButtons[0]?.props?.title === '查看归档',
+  JSON.stringify(railButtons[0]?.props?.children).slice(0, 120));
+check('the rail glyph stays at 20px',
+  (railElements ?? []).some(element => element.props?.viewBox === '0 0 24 24' && element.props.width === 20),
+  JSON.stringify((railElements ?? []).filter(element => element.props?.viewBox === '0 0 24 24').map(element => element.props.width)));
 
 // A missing `t` must not blank the entry: the owner may omit the translator.
 let noTranslateError;
@@ -240,6 +254,8 @@ function expandAll(element, depth = 0) {
 const transcriptItems = [
   { kind: 'turn', seq: 1, time: 1, turn: 1, phase: 'start' },
   { kind: 'title', seq: 2, time: 2, text: '会话标题' },
+  // A compaction boundary: the summary card, not a prompt the user typed.
+  { kind: 'compaction', seq: 30, time: 30, text: '压缩摘要正文', shadowed: 12, provider: 'p' },
   { kind: 'injected', seq: 3, time: 3, label: 'agent-instructions', text: '<system-reminder>rules</system-reminder>' },
   { kind: 'user', seq: 4, time: 4, text: '手打的话', source: 'user' },
   { kind: 'assistant', seq: 5, time: 5, text: '回答', reasoning: '想想', model: 'm', provider: 'p', usage: { input: 1, output: 2 } },
@@ -285,7 +301,18 @@ check('the transcript scroller is ref-addressable so a new session can reset it'
   'aav-flow carries no ref');
 // Cards only: `aav-msgHead` / `aav-msgBody` also carry the "aav-msg" prefix.
 const cardCount = flowElements.filter(element => String(element.props?.className ?? '').split(' ')[0] === 'aav-msg').length;
-check('every transcript row produced a card', cardCount === 5, String(cardCount));
+check('every transcript row produced a card', cardCount === 6, String(cardCount));
+check('a compaction boundary renders its own card',
+  flowElements.some(element => String(element.props?.className ?? '') === 'aav-msg aav-compaction'),
+  JSON.stringify([...new Set(flowElements.map(element => String(element.props?.className ?? '')))].slice(0, 12)));
+check('the compaction card names what it is',
+  flowElements.some(element => String(element.props?.children ?? '').includes('上下文压缩')));
+check('the compaction card states how many records it folded',
+  flowElements.some(element => String(element.props?.children ?? '').includes('折叠了 12 条更早的记录')));
+check('the compaction summary sits behind a collapsed summary control',
+  flowElements.some(element => element.type === 'summary' && element.props?.children === '查看压缩摘要'));
+check('the compaction summary text is present once expanded',
+  flowElements.some(element => element.type === 'pre' && String(element.props?.children ?? '') === '压缩摘要正文'));
 check('the tool row shows its tool name', flowElements.some(element => String(element.props?.className ?? '') === 'aav-toolName' && element.props.children === 'read'));
 check('an unnamed tool row says so instead of inventing a name', flowElements.some(element => String(element.props?.className ?? '') === 'aav-toolName' && element.props.children === '(未记录工具名)'));
 check('an unpaired result is badged', flowElements.some(element => String(element.props?.className ?? '') === 'aav-badge' && element.props.children === '仅结果'));

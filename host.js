@@ -207,8 +207,21 @@ const DEFAULT_LIST_LIMIT = 50;
 const MAX_LIST_LIMIT = 500;
 /** Per-block character cap for rendered transcript text. */
 const MAX_BLOCK_CHARS = 8000;
-/** Most recent transcript rows returned for one read. */
-const MAX_ROWS = 1200;
+/**
+ * A compaction summary is the compressed history itself, not a chat message, so
+ * it gets its own larger cap. Clipping it at the block size is half of what
+ * made a checkpoint look truncated; the other half was reading the model
+ * surface, which replaces the original span with that summary.
+ */
+const MAX_COMPACTION_CHARS = 24000;
+/**
+ * Most recent transcript rows returned for one read.
+ *
+ * Sized against this library rather than picked round: the largest archived log
+ * folds to ~1700 rows (two compactions, 3855 events), and a lower cap would
+ * drop the head of the conversation — the very messages a compaction replaced.
+ */
+const MAX_ROWS = 4000;
 
 /** Session ids are directory names under one validated root; reject anything
  * that could escape it before a path is ever composed. */
@@ -440,10 +453,24 @@ export function buildRows(events, header, options = {}) {
   const resultsInOrder = [];
   for (const event of events) {
     if (event.type !== "tool/result") continue;
+    // A pruner replacement shadows the original result; pairing must use the
+    // original, or a tool row would show the shortened stub instead of the
+    // output that was actually produced.
+    if (isReplaceOp(event)) continue;
     const callId = event.data?.message?.source?.callId ?? event.data?.toolCallId;
     if (typeof callId === "string") resultsById.set(callId, event);
     resultsInOrder.push({ seq: event.seq, event });
   }
+  // One compaction is one reader-facing event: the summary record and the
+  // synthesized user message that carries the same text. The summary is
+  // rendered; the message is skipped when its replaced range matches.
+  const compactionRanges = new Set();
+  for (const event of events) {
+    if (event.type !== "compaction/summary") continue;
+    const range = event.data?.shadowedRange;
+    if (range !== undefined && range !== null) compactionRanges.add(`${range.start}:${range.end}`);
+  }
+  let compacted = 0;
   const takeResult = (callId, seq) => {
     let hit = typeof callId === "string" ? resultsById.get(callId) : undefined;
     if (hit === undefined) {
@@ -461,6 +488,20 @@ export function buildRows(events, header, options = {}) {
     const base = { seq: event.seq, time: event.time };
     switch (event.type) {
       case "user/message": {
+        // A compaction checkpoint is a synthesized user message that replaces a
+        // span in the model surface. The span itself is still in this log, and
+        // the summary record carries the same text, so the message is skipped —
+        // unless a log ever lacks the summary, in which case it is rendered as
+        // the compaction row it really is rather than as something the user
+        // typed.
+        if (isCompactionCheckpoint(event)) {
+          const op = event.surfaceOp;
+          if (!compactionRanges.has(`${op.startSeq}:${op.endSeq}`)) {
+            rows.push({ ...base, kind: "compaction", text: clip(contentText(data.content), MAX_COMPACTION_CHARS), shadowed: 0 });
+            compacted += 1;
+          }
+          break;
+        }
         const kind = data.source?.kind;
         const text = contentText(data.content);
         // Harness-injected context (runtime snapshot, workspace instructions,
@@ -481,12 +522,18 @@ export function buildRows(events, header, options = {}) {
       case "assistant/message": {
         const parts = assistantParts(data.stream);
         const fallback = contentText(data.message?.content);
+        const text = parts.text !== "" ? parts.text : fallback;
+        // A step that only calls tools logs an assistant message with no prose
+        // (measured on this library: 3,850 of 31,819 assistant messages). Its
+        // calls are rendered as their own rows, so an empty card is noise —
+        // except for an interrupted step, where that badge is the record.
+        if (text.trim() === "" && parts.reasoning.trim() === "" && data.interrupted !== true) break;
         rows.push({
           ...base,
           kind: "assistant",
           turn: data.turn,
           step: data.step,
-          text: clip(parts.text !== "" ? parts.text : fallback),
+          text: clip(text),
           reasoning: clip(parts.reasoning, 4000),
           model: data.message?.source?.model,
           provider: data.message?.source?.provider,
@@ -513,6 +560,11 @@ export function buildRows(events, header, options = {}) {
         break;
       }
       case "tool/result": {
+        // The tool-result pruner appends a replacement result that replaces the
+        // original in the model surface. The original is the history this
+        // reader wants, so the replacement is skipped (the original already
+        // paired with its call); otherwise the pruned stub would win.
+        if (isReplaceOp(event)) break;
         if (consumed.has(event.seq)) break;
         const callId = data.message?.source?.callId ?? data.toolCallId;
         const meta = typeof callId === "string" ? callsById.get(callId) : undefined;
@@ -528,9 +580,14 @@ export function buildRows(events, header, options = {}) {
         });
         break;
       }
-      case "system/message":
-        rows.push({ ...base, kind: "injected", label: "system", text: clip(contentText(data.message?.content)) });
+      case "system/message": {
+        // The agent loop re-baselines the runtime-context system message by
+        // appending an empty replacement; an empty injected row is noise.
+        const text = contentText(data.message?.content);
+        if (text === "") break;
+        rows.push({ ...base, kind: "injected", label: "system", text: clip(text) });
         break;
+      }
       case "developer/message":
         rows.push({ ...base, kind: "injected", label: "developer", text: clip(contentText(data.message?.content)) });
         break;
@@ -573,9 +630,24 @@ export function buildRows(events, header, options = {}) {
         rows.push({ ...base, kind: "turn", turn: data.turn, phase: "end", reason });
         break;
       }
-      case "compaction":
-        rows.push({ ...base, kind: "notice", label: "compaction", text: "" });
+      case "compaction/summary": {
+        // The compressed history itself. It is rendered as its own card so the
+        // conversation above it can stay verbatim: a reader wants to see what
+        // the model was told, not have the earlier messages silently vanish.
+        const blocks = Array.isArray(data.summary) ? data.summary : [];
+        const text = blocks.map(block => (typeof block?.text === "string" ? block.text : "")).join("");
+        rows.push({
+          ...base,
+          kind: "compaction",
+          text: clip(text, MAX_COMPACTION_CHARS),
+          shadowed: Array.isArray(data.shadowedSeqs) ? data.shadowedSeqs.length : 0,
+          tokens: typeof data.shadowedTokenCount === "number" ? data.shadowedTokenCount : undefined,
+          provider: data.provider,
+          model: data.model
+        });
+        compacted += 1;
         break;
+      }
       case "session/end-seed":
         if (data.inherited !== true) rows.push({ ...base, kind: "notice", label: "seed", text: "" });
         break;
@@ -584,12 +656,13 @@ export function buildRows(events, header, options = {}) {
     }
   }
 
-  const filtered = rows.filter(row => row.kind !== "notice" || row.text !== "" || row.label === "seed" || row.label === "compaction");
+  const filtered = rows.filter(row => row.kind !== "notice" || row.text !== "" || row.label === "seed");
   const truncated = filtered.length > MAX_ROWS;
   const items = truncated ? filtered.slice(filtered.length - MAX_ROWS) : filtered;
   return {
     items,
     truncated,
+    compacted,
     rowCount: filtered.length,
     eventCount: events.length,
     firstSeq: events.length > 0 ? events[0].seq : undefined,
@@ -608,25 +681,37 @@ export function buildRows(events, header, options = {}) {
   };
 }
 
-/** Build the transcript payload from one live/prepared observation. */
+/** The preamble compaction writes at the head of its synthesized user message. */
+const COMPACTION_PREAMBLE = "This is an automatically generated checkpoint";
+
+/** Whether an event replaces a span in the model surface (compaction, pruning). */
+function isReplaceOp(event) {
+  const op = event?.surfaceOp;
+  return op !== null && typeof op === "object" && op.op === "replace";
+}
+
+/** Whether an event is the synthesized user message compaction appends. */
+function isCompactionCheckpoint(event) {
+  if (event?.type !== "user/message" || !isReplaceOp(event)) return false;
+  const text = contentText(event.data?.content);
+  return text.startsWith(COMPACTION_PREAMBLE);
+}
+
+/** Build the transcript payload from the durable log.
+ *
+ * The log — not the model surface — is what this reader renders. The surface is
+ * the model's current view: compaction replaces the original span with a
+ * checkpoint summary, and the tool-result pruner swaps old results for stubs.
+ * Both are deliberate for the model and both would hide history from a reader,
+ * so the fold below walks the log and marks the compaction points instead.
+ */
 export async function transcriptFor(sessionQuery, sessionId) {
   const snapshot = await sessionQuery.readSession(sessionId);
   const events = Array.isArray(snapshot?.events) ? snapshot.events : [];
-  let surfaceEvents = events;
-  let surfaceAvailable = false;
-  if (typeof sessionQuery.readSurface === "function") {
-    try {
-      const surface = await sessionQuery.readSurface(sessionId);
-      if (Array.isArray(surface?.events) && surface.events.length > 0) {
-        surfaceEvents = surface.events;
-        surfaceAvailable = true;
-      }
-    } catch { /* surface read is an optimization; the raw log stands in */ }
-  }
-  // The surface view omits `tool/call` events, so tool metadata is collected
-  // from the complete log and merged in while folding the surface rows.
+  // Tool metadata always comes from the complete log: the fold below renders
+  // results that the surface would have replaced.
   const callsById = collectCallMeta(events);
-  const built = buildRows(surfaceEvents, snapshot?.session, { callsById });
+  const built = buildRows(events, snapshot?.session, { callsById });
   const injectedCount = built.items.reduce((total, row) => total + (isInjectedRow(row) ? 1 : 0), 0);
   const usage = events.reduce((total, event) => {
     const value = event.data?.usage;
@@ -646,7 +731,7 @@ export async function transcriptFor(sessionQuery, sessionId) {
     eventCount: built.eventCount,
     injectedCount,
     callCount: callsById.size,
-    surfaceAvailable,
+    compacted: built.compacted,
     firstSeq: built.firstSeq,
     lastSeq: built.lastSeq,
     lastTime: built.lastTime,

@@ -172,14 +172,107 @@ check("title event becomes a title row", built.items.some(item => item.kind === 
 check("cwd change becomes a notice row", built.items.some(item => item.kind === "notice" && item.label === "cwd" && item.text === "E:\\x"), JSON.stringify(built.items.filter(item => item.kind === "notice")));
 check("header is echoed into the payload", built.header.id === "s1" && built.header.cwd === "E:\\x");
 
+// --- 3b. compaction is a boundary, not the first prompt --------------------
+// Compaction leaves the original events in the log and appends one synthesized
+// user message (`surfaceOp: replace`) that the model surface shows in their
+// place. A reader wants the log: the originals must render, and the checkpoint
+// must become its own card instead of masquerading as something the user typed.
+const compactedLog = [
+  { type: "user/message", seq: 1, time: 1, data: { content: [{ type: "text", text: "真正第一句" }], source: { kind: "user" } } },
+  { type: "assistant/message", seq: 2, time: 2, data: { turn: 1, step: 1, message: { content: [{ type: "text", text: "回答一" }] } } },
+  { type: "compaction/start", seq: 3, time: 3, data: { compactionId: "c1" } },
+  {
+    type: "compaction/summary", seq: 4, time: 4,
+    data: { compactionId: "c1", summary: [{ type: "text", text: "SUMMARY-TEXT" }], shadowedRange: { start: 1, end: 2 }, shadowedSeqs: [1, 2], shadowedTokenCount: 123, provider: "p", model: "m" }
+  },
+  {
+    type: "user/message", seq: 5, time: 5,
+    surfaceOp: { op: "replace", startSeq: 1, endSeq: 2 },
+    data: { content: [{ type: "text", text: "This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context.\n\n<compacted-summary>SUMMARY-TEXT</compacted-summary>" }], source: { kind: "user" } }
+  },
+  { type: "compaction/end", seq: 6, time: 6, data: { compactionId: "c1" } },
+  { type: "user/message", seq: 7, time: 7, data: { content: [{ type: "text", text: "压缩后的问题" }], source: { kind: "user" } } }
+];
+const compactedRows = buildRows(compactedLog, undefined);
+check("the original first prompt stays the first user row",
+  compactedRows.items[0].kind === "user" && compactedRows.items[0].text === "真正第一句",
+  JSON.stringify(compactedRows.items.slice(0, 2)));
+check("the checkpoint message is not rendered as a user prompt",
+  !compactedRows.items.some(item => item.kind === "user" && item.text.includes("automatically generated checkpoint")),
+  JSON.stringify(compactedRows.items.filter(item => item.kind === "user").map(item => item.text)));
+const compactionCard = compactedRows.items.find(item => item.kind === "compaction");
+check("the compaction becomes its own card",
+  compactedRows.items.filter(item => item.kind === "compaction").length === 1
+  && compactionCard?.text === "SUMMARY-TEXT" && compactionCard?.shadowed === 2,
+  JSON.stringify(compactionCard));
+check("the fold reports how many compactions it crossed", compactedRows.compacted === 1, String(compactedRows.compacted));
+check("a checkpoint without a summary record is still not a user prompt", (() => {
+  const rows = buildRows([{
+    type: "user/message", seq: 1, time: 1,
+    surfaceOp: { op: "replace", startSeq: 5, endSeq: 6 },
+    data: { content: [{ type: "text", text: "This is an automatically generated checkpoint condensing an earlier span." }], source: { kind: "user" } }
+  }], undefined);
+  return rows.items.length === 1 && rows.items[0].kind === "compaction";
+})(), "a checkpoint leaked into the prompt rows");
+
+// The tool-result pruner appends a replacement result. Pairing must keep the
+// original text: the shortened stub is what the model sees later, not what the
+// tool returned.
+const prunedLog = [
+  { type: "tool/call", seq: 1, time: 1, data: { callId: "c1", name: "read", arguments: "{}" } },
+  { type: "tool/result", seq: 2, time: 2, data: { message: { source: { callId: "c1" }, content: [{ type: "text", text: "FULL-OUTPUT" }] } } },
+  { type: "compaction/prune", seq: 3, time: 3, data: { shadowedSeqs: [2], shadowedRange: { start: 2, end: 2 } } },
+  {
+    type: "tool/result", seq: 4, time: 4,
+    surfaceOp: { op: "replace", startSeq: 2, endSeq: 2 },
+    data: { message: { source: { callId: "c1" }, content: [{ type: "text", text: "[pruned]" }] } }
+  }
+];
+const prunedRows = buildRows(prunedLog, undefined);
+check("a pruned tool result keeps the original output",
+  prunedRows.items.find(item => item.kind === "tool")?.result === "FULL-OUTPUT",
+  JSON.stringify(prunedRows.items.map(item => item.result)));
+check("the pruner replacement is not rendered as a second row",
+  prunedRows.items.filter(item => item.kind === "tool").length === 1,
+  JSON.stringify(prunedRows.items.map(item => item.result)));
+
+// The agent loop re-baselines the runtime-context system message with an empty
+// replacement; an empty injected row is noise.
+const rebaselined = buildRows([
+  { type: "system/message", seq: 1, time: 1, data: { message: { content: [{ type: "text", text: "sys" }] } } },
+  { type: "system/message", seq: 2, time: 2, data: { message: { content: [{ type: "text", text: "" }] } } }
+], undefined);
+check("an empty system-message replacement is not a row", rebaselined.items.length === 1, JSON.stringify(rebaselined.items));
+
+// A step that only calls tools: the assistant message has no prose or
+// reasoning, and its calls are rendered as tool rows. It must not produce an
+// empty assistant card; an interrupted empty step still keeps one.
+const toolOnlyStep = buildRows([
+  {
+    type: "assistant/message", seq: 1, time: 1,
+    data: { turn: 1, step: 1, message: { content: [] }, stream: [{ type: "tool-call-chunks", time0: 0, index: 0, dt: [1], id: "c1", args: ["{}"] }] }
+  },
+  { type: "tool/call", seq: 2, time: 2, data: { turn: 1, step: 1, callId: "c1", name: "read", arguments: "{}" } },
+  { type: "tool/result", seq: 3, time: 3, data: { message: { source: { callId: "c1" }, content: [{ type: "text", text: "body" }] } } }
+], undefined);
+check("a tool-only step does not become an empty assistant card",
+  !toolOnlyStep.items.some(item => item.kind === "assistant") && toolOnlyStep.items.filter(item => item.kind === "tool").length === 1,
+  JSON.stringify(toolOnlyStep.items.map(item => item.kind)));
+const interruptedStep = buildRows([
+  { type: "assistant/message", seq: 1, time: 1, data: { interrupted: true, message: { content: [] } } }
+], undefined);
+check("an interrupted empty step still gets its card",
+  interruptedStep.items.length === 1 && interruptedStep.items[0].kind === "assistant" && interruptedStep.items[0].interrupted === true,
+  JSON.stringify(interruptedStep.items));
+
 const clipped = buildRows([{ type: "user/message", seq: 1, time: 1, data: { content: [{ type: "text", text: "x".repeat(9000) }], source: { kind: "user" } } }], undefined);
 check("long blocks are clipped with a marker", clipped.items[0].text.length < 9000 && clipped.items[0].text.includes("已截断"));
 
-const many = buildRows(Array.from({ length: 1300 }, (_, index) => ({
+const many = buildRows(Array.from({ length: 4100 }, (_, index) => ({
   type: "user/message", seq: index, time: index, data: { content: [{ type: "text", text: `m${index}` }], source: { kind: "user" } }
 })), undefined);
-check("row cap truncates and reports it", many.truncated === true && many.items.length === 1200 && many.rowCount === 1300);
-check("truncation keeps the newest rows", many.items[many.items.length - 1].text === "m1299");
+check("row cap truncates and reports it", many.truncated === true && many.items.length === 4000 && many.rowCount === 4100);
+check("truncation keeps the newest rows", many.items[many.items.length - 1].text === "m4099");
 
 // --- 4. helpers -----------------------------------------------------------
 check("assistantParts tolerates a missing stream", assistantParts(undefined).text === "" && assistantParts(undefined).reasoning === "");
@@ -233,7 +326,10 @@ const fakeCtx = {
       session: { id: ARCHIVED_ID, version: 4, createdAt: 111, cwd: "E:\\codeVibe\\debug", isSeeded: false },
       events: synthetic
     }),
-    readSurface: async () => ({ events: synthetic })
+    // The reader folds the durable log; the model surface (which compaction
+    // rewrites) must not be read at all. A throw fails the route loudly if the
+    // old source ever comes back.
+    readSurface: async () => { throw new Error("the transcript must not read the model surface"); }
   }
 };
 apply(fakeCtx, { dshHome: "E:\\nonexistent-dsh-home-for-tests" });
@@ -256,7 +352,10 @@ check("list reports a missing artifact honestly", routed.payload.result.sessions
 
 const transcript = await call(`${API_PREFIX}/transcript?sessionId=${encodeURIComponent(ARCHIVED_ID)}`);
 check("GET /transcript answers 200", transcript.status === 200 && transcript.payload?.ok === true, JSON.stringify(transcript.payload).slice(0, 200));
-check("transcript reports the surface path", transcript.payload.result.surfaceAvailable === true);
+check("transcript is folded from the durable log",
+  transcript.payload.result.items[0].text === "hello" && transcript.payload.result.surfaceAvailable === undefined,
+  JSON.stringify(transcript.payload.result.items[0]));
+check("transcript reports the compactions it crossed", transcript.payload.result.compacted === 0, String(transcript.payload.result.compacted));
 check("transcript carries the folded rows", transcript.payload.result.items.length === 9);
 check("transcript aggregates usage", transcript.payload.result.usage.calls === 1 && transcript.payload.result.usage.input === 10);
 
