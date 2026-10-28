@@ -16,6 +16,7 @@ import { homedir } from "node:os";
 import {
   API_PREFIX,
   apply,
+  archiveMeta,
   assertSessionId,
   assistantParts,
   buildRows,
@@ -220,6 +221,9 @@ const fakeCtx = {
   workspaceRegistry: {
     archivedSessionIds: [ARCHIVED_ID],
     list: () => [{ id: "ws-1", title: "调试工作区", path: "E:\\codeVibe\\debug", sessionIds: [ARCHIVED_ID] }],
+    // The in-memory header index the Client-side list's metadata answer reads:
+    // no disk I/O, and the only source of `createdAt` on this side.
+    headers: new Map([[ARCHIVED_ID, { id: ARCHIVED_ID, createdAt: 111, cwd: "E:\\codeVibe\\debug" }]]),
     unarchiveSession: async (id) => { unarchived.push(id); }
   },
   sessionQuery: {
@@ -264,6 +268,67 @@ check("a path-shaped id is rejected as a bad request", badId.status === 400, JSO
 
 const workspaces = await call(`${API_PREFIX}/workspaces`);
 check("GET /workspaces lists registry workspaces", workspaces.payload.result.items[0].title === "调试工作区");
+
+// --- 4a. the Client-held list's metadata answer ----------------------------
+// The list itself no longer comes from the Host: the Client derives it from
+// DSH's own sessions/workspaces snapshots. These are the only facts it cannot
+// see there, and they are asked for once, over the whole archive set — never
+// per page. That is what removes the 500-row ceiling instead of raising it.
+const metaRoute = await call(`${API_PREFIX}/meta`);
+check("GET /meta answers 200", metaRoute.status === 200 && metaRoute.payload?.ok === true, JSON.stringify(metaRoute.payload));
+check("meta carries createdAt from the registry header index",
+  metaRoute.payload.result.createdAt[ARCHIVED_ID] === 111, JSON.stringify(metaRoute.payload.result.createdAt));
+check("meta omits a size for a session with no artifact on disk",
+  metaRoute.payload.result.bytes[ARCHIVED_ID] === undefined, JSON.stringify(metaRoute.payload.result.bytes));
+check("meta reports the internal-machinery exclusion set",
+  Array.isArray(metaRoute.payload.result.excluded) && metaRoute.payload.result.excluded.length === 0,
+  JSON.stringify(metaRoute.payload.result.excluded));
+check("meta counts the archive set it answered for", metaRoute.payload.result.archivedIdCount === 1,
+  String(metaRoute.payload.result.archivedIdCount));
+
+const metaHeaders = new Map([
+  ["session-a", { id: "session-a", createdAt: 1500, cwd: "E:\\codeVibe\\debug" }],
+  ["session-old", { id: "session-old", createdAt: "2026-01-02T03:04:05.000Z", cwd: "E:\\codeVibe\\temp" }],
+  ["session-workbench", { id: "session-workbench", createdAt: 900, cwd: "E:\\DeepSeek Harness\\aik_auto_memory_use" }]
+]);
+const metaArtifacts = new Map([
+  ["session-a", { path: "a", bytes: 4096, mtime: 7000, project: "debug" }],
+  ["session-noheader", { path: "b", bytes: 12, mtime: 8000, project: "aik_auto_memory_use" }]
+]);
+const metaPure = archiveMeta({
+  workspaceRegistry: { archivedSessionIds: ["session-a", "session-old", "session-workbench", "session-noheader", "session-stale"], headers: metaHeaders },
+  artifactIndex: metaArtifacts,
+  excludedPaths: configExcludedPaths({})
+});
+check("meta reads createdAt for the ids the header index knows",
+  metaPure.createdAt["session-a"] === 1500 && metaPure.createdAt["session-old"] === Date.parse("2026-01-02T03:04:05.000Z"),
+  JSON.stringify(metaPure.createdAt));
+check("meta normalizes an ISO createdAt to epoch milliseconds",
+  typeof metaPure.createdAt["session-old"] === "number" && Number.isFinite(metaPure.createdAt["session-old"]),
+  String(metaPure.createdAt["session-old"]));
+check("meta carries the artifact size and mtime for one session",
+  metaPure.bytes["session-a"] === 4096 && metaPure.mtime["session-a"] === 7000,
+  JSON.stringify([metaPure.bytes, metaPure.mtime]));
+check("meta leaves a stale archived id out of every map",
+  metaPure.createdAt["session-stale"] === undefined && metaPure.bytes["session-stale"] === undefined,
+  JSON.stringify([metaPure.createdAt, metaPure.bytes]));
+check("meta excludes internal machinery by its header cwd",
+  metaPure.excluded.includes("session-workbench"), JSON.stringify(metaPure.excluded));
+check("meta falls back to the artifact project directory when a header is missing",
+  metaPure.excluded.includes("session-noheader"), JSON.stringify(metaPure.excluded));
+check("meta keeps a real session that simply has no header",
+  metaPure.bytes["session-noheader"] === 12 && metaPure.createdAt["session-noheader"] === undefined,
+  JSON.stringify(metaPure.bytes));
+const metaObjectHeaders = archiveMeta({
+  workspaceRegistry: { archivedSessionIds: ["session-a"], headers: { "session-a": { createdAt: 42 } } },
+  artifactIndex: new Map(),
+  excludedPaths: []
+});
+check("meta accepts a plain-object header index as well as a Map",
+  metaObjectHeaders.createdAt["session-a"] === 42, JSON.stringify(metaObjectHeaders));
+check("meta survives a registry without a header index at all",
+  JSON.stringify(archiveMeta({ workspaceRegistry: { archivedSessionIds: ["x"] }, artifactIndex: new Map(), excludedPaths: [] }).createdAt) === "{}",
+  "createdAt should stay empty rather than throw");
 
 // The route-level workspace filter: the reader's selector addresses the list
 // through this parameter, and the response says which filter it applied.
@@ -848,6 +913,22 @@ if (process.env.ARCHIVE_VIEWER_LIVE === "1") {
       const live = await liveCall(`${API_PREFIX}/sessions`);
       const sessions = live.sessions;
       check("live: registry count is reported", live.archivedCount === archivedIds.length, String(live.archivedCount));
+      // The Client half's one metadata answer, checked against the legacy list
+      // on the same real library: it must describe the whole archive set (not a
+      // page), agree on the internal-machinery exclusion, and carry real sizes.
+      const liveMeta = await liveCall(`${API_PREFIX}/meta`);
+      check("live: meta answers for the whole archive set",
+        liveMeta.archivedIdCount === archivedIds.length, String(liveMeta.archivedIdCount));
+      check("live: meta agrees with the legacy list on the hidden set",
+        liveMeta.excluded.length === live.hiddenCount,
+        JSON.stringify({ meta: liveMeta.excluded.length, hidden: live.hiddenCount }));
+      check("live: every hidden id is a member of the archive set",
+        liveMeta.excluded.every(id => archivedIds.includes(id)), JSON.stringify(liveMeta.excluded));
+      check("live: meta carries artifact sizes for real sessions",
+        Object.keys(liveMeta.bytes).length > 0 && Object.keys(liveMeta.bytes).length <= live.archivedCount,
+        JSON.stringify({ sized: Object.keys(liveMeta.bytes).length, archived: live.archivedCount }));
+      check("live: meta never invents a size for a stale id",
+        Object.keys(liveMeta.bytes).every(id => archivedIds.includes(id)), "a size appeared for an id outside the archive set");
       check("live: artifacts were found", sessions.some(session => typeof session.bytes === "number"));
       const withArtifact = sessions.find(session => typeof session.bytes === "number");
       check("live: artifact size is plausible", withArtifact.bytes > 0, JSON.stringify(withArtifact));

@@ -56,54 +56,73 @@ window.__ModuleLoader__.load({
     };
     report('factory:start');
 
+    /**
+     * The archive list is derived from DSH's own Client stores: `sessions.list`
+     * holds every ordinary Session — archived ones included, which is why the
+     * shipped Workspace view can show them with a view option — and
+     * `workspaces.list` holds the archive set and workspace membership. The
+     * Host is asked exactly once per archive-set change for the three facts
+     * those snapshots do not carry (createdAt, artifact size, exclusion of
+     * internal machinery). Nothing is paged, so nothing has a page ceiling.
+     */
+    const LIST_WINDOW = 200;
+    const EMPTY_SESSIONS = { ids: [], byId: {} };
+    const EMPTY_WORKSPACES = { items: [], archivedSessionIds: [], pinnedSessionIds: [] };
+
+    /** The Client context, captured by `apply`: the stores it carries are the
+     * list's data source. Null before apply, which is why every reader uses
+     * optional chaining and a stable empty snapshot. */
+    let clientCtx = null;
+    const sessionsSnapshot = () => clientCtx?.sessions?.list?.getSnapshot?.() ?? EMPTY_SESSIONS;
+    const workspacesSnapshot = () => clientCtx?.workspaces?.list?.getSnapshot?.() ?? EMPTY_WORKSPACES;
+    const subscribeSessions = (listener) => {
+      const model = clientCtx?.sessions?.list;
+      return model !== undefined && typeof model.subscribe === 'function' ? model.subscribe(listener) : () => {};
+    };
+    const subscribeWorkspaces = (listener) => {
+      const model = clientCtx?.workspaces?.list;
+      return model !== undefined && typeof model.subscribe === 'function' ? model.subscribe(listener) : () => {};
+    };
+
     /** Small external store so the dialog and the footer button stay in sync. */
     const store = {
       state: {
         open: false,
-        sessions: [],
-        listTotal: 0,
-        listHasMore: false,
-        listHidden: 0,
-        // Page size requested from the Host; grows by one page per 'load more'.
-        listLimit: 50,
-        listPhase: 'idle',
-        listError: '',
+        // The Host's one-shot answer for the whole archive set: createdAt,
+        // artifact size, and the internal-machinery exclusion.
+        meta: null,
+        metaPhase: 'idle',
+        metaKey: '',
+        metaError: '',
+        // Rows painted per click. A rendering window, never a request size, so
+        // it cannot cap what the archive holds.
+        showCount: LIST_WINDOW,
         query: '',
-        // '' = every workspace; a workspace id; or 'ungrouped'. The filter is
-        // applied by the Host over the whole archive, never over the loaded
-        // page, so it cannot under-report a workspace bigger than one page.
+        // '' = every workspace; a workspace id; or 'ungrouped'. Filtering is
+        // local, over every derived row, so a workspace holding more sessions
+        // than the window is still counted and searched in full.
         workspaceFilter: '',
-        // Options and counts come from the list payload: the Host already has
-        // the registry and the headers in hand, so the reader never derives
-        // them from a page it only partially holds.
-        workspaceOptions: [],
-        ungroupedCount: 0,
-        // Visible archive size with no workspace filter ("all workspaces").
-        visibleTotal: 0,
-        // null until the first list response says whether the Host understands
-        // the filter; false means an older Host that ignores `workspace=`.
-        filterSupported: null,
-        // Set when the Host reported that the selected workspace no longer has
-        // archived sessions and the reader fell back to "all": the selection
-        // must not vanish silently.
+        // Set when the chosen workspace lost its last archived session and the
+        // reader fell back to "all": a selection must not vanish silently.
         filterDropped: false,
-        // Set when the Host could not resolve session ownership at all (its
-        // persistence read failed). Every session then looks ungrouped, so a
-        // filtered answer of "nothing" says nothing about that workspace.
-        groupingFailed: false,
         selectedId: '',
         transcript: null,
         rowPhase: 'idle',
         rowError: '',
         notice: '',
-        workspaces: {},
         // Defaults to hiding injected context; the stored preference wins.
         hideInjected: true
       },
       listeners: new Set(),
       set(patch) {
-        store.state = { ...store.state, ...patch };
+        // Opening the panel always starts from the first window: a previous
+        // "show more" must not decide how much a new visit paints.
+        const next = patch.open === true ? { ...patch, showCount: LIST_WINDOW } : patch;
+        store.state = { ...store.state, ...next };
         for (const listener of store.listeners) listener();
+        // Opening the panel is when the metadata has to be there; an archive
+        // set that changes while it is open is handled by the snapshot effect.
+        if (patch.open === true) void ensureMeta();
       },
       subscribe(listener) {
         store.listeners.add(listener);
@@ -150,100 +169,158 @@ window.__ModuleLoader__.load({
       return session.id;
     }
 
-    /**
-     * Monotonic id of the newest list request. Only that request may write the
-     * list state: the selector fires a request per change and the fallback below
-     * fires one of its own, so without this an older answer would land on top of
-     * the user's latest choice (measured: pick B, then A's slower answer puts
-     * the screen back on A). `loadTranscript` has the same guard per session.
-     */
-    let listSeq = 0;
+    /** Key of the archive set the current metadata describes. */
+    const archiveKey = () => (workspacesSnapshot().archivedSessionIds ?? []).map(String).join('\0');
 
-    async function loadSessions(options = {}) {
-      const seq = ++listSeq;
-      store.set({ listPhase: 'loading', listError: '' });
-      try {
-        // A manual refresh drops the Host's title/scan caches; ordinary opens
-        // reuse them so the list paints without re-inflating any session log.
-        // Never let the page size fall back to undefined: an unset limit used
-        // to be indistinguishable from 'no request happened at all'.
-        const current = Number.isSafeInteger(store.state.listLimit) && store.state.listLimit > 0 ? store.state.listLimit : 50;
-        const limit = Number.isSafeInteger(options.limit) && options.limit > 0 ? options.limit : current;
-        // The workspace to ask for: an explicit one when the selector just
-        // changed, otherwise whatever is in force. '' asks for the whole
-        // archive, which is also how a stale selection is dropped.
-        const workspace = typeof options.workspace === 'string' ? options.workspace : store.state.workspaceFilter;
-        // Built by concatenation on purpose: an editor that eats `${...}` in a
-        // template literal silently turned this into "?limit=", so the Host fell
-        // back to its default page and "load more" reloaded the same page.
-        let query = '/sessions?limit=' + String(limit);
-        if (workspace !== '') query += '&workspace=' + encodeURIComponent(workspace);
-        if (options.force) query += '&refresh=1';
-        const result = await api(query);
-        if (seq !== listSeq) return;
-        const returned = (result.sessions || []).length;
-        const workspaceOptions = Array.isArray(result.workspaceOptions) ? result.workspaceOptions : [];
-        // The Host echoes the filter it applied. An older Host neither echoes
-        // nor understands the parameter, which the panel reports instead of
-        // showing a filter that is not in force.
-        const supported = typeof result.workspace === 'string';
-        const applied = supported ? result.workspace : '';
-        const ungroupedCount = Number.isSafeInteger(result.ungroupedCount) ? result.ungroupedCount : 0;
-        // With the ownership read failed, EVERY session looks ungrouped: an
-        // empty answer for a workspace means "cannot tell", not "nothing there".
-        // The selection is therefore kept, and the reader says what happened.
-        const groupingFailed = result.groupingFailed === true;
-        const stillExists = groupingFailed
-          || applied === ''
-          || workspaceOptions.some(option => option.id === applied)
-          || (applied === 'ungrouped' && ungroupedCount > 0);
-        // The selected workspace can lose its last archived session while the
-        // panel is open (restored elsewhere, or trimmed by "clean up leftovers").
-        // Its option is then gone, and a select showing nothing would strand the
-        // list on an empty page: fall back to "all" once, and say so — a
-        // selection that clears itself without a word reads as a bug.
-        if (!stillExists && options.retried !== true) {
-          if (seq === listSeq) store.set({ workspaceFilter: '', filterDropped: true });
-          await loadSessions({ ...options, workspace: '', retried: true });
-          return;
-        }
-        report('list:fetched', JSON.stringify({
-          limit,
-          url: query,
-          returned,
-          total: result.total ?? result.archivedCount,
-          hasMore: result.hasMore === true,
-          workspace: applied,
-          // Loud when the Host answered a different page size than requested.
-          limitHonoured: returned === Math.min(limit, result.total ?? result.archivedCount ?? returned),
-          titleSources: [...new Set((result.sessions || []).map(session => session.titleSource))]
-        }));
-        store.set({
-          sessions: result.sessions || [],
-          // Keep the requested size as the baseline for "load more": a filtered
-          // page is short by nature, and shrinking the page size to it would
-          // make the next unfiltered request come back 3 rows long.
-          listLimit: Math.max(limit, returned),
-          listTotal: result.total ?? result.archivedCount ?? returned,
-          visibleTotal: Number.isSafeInteger(result.visibleTotal) ? result.visibleTotal : (result.total ?? returned),
-          listHasMore: result.hasMore === true,
-          listHidden: result.hiddenCount ?? 0,
-          workspaceFilter: stillExists ? applied : '',
-          workspaceOptions,
-          ungroupedCount,
-          groupingFailed,
-          filterSupported: supported,
-          listPhase: 'ready'
-        });
-      } catch (error) {
-        // A superseded request must not paint its failure over the newer one.
-        if (seq !== listSeq) return;
-        report('list:failed', String(error && error.message));
-        // Drop the rows: they belong to the previous query, and leaving them
-        // under a changed selector claims "this workspace holds these sessions".
-        // The options stay, so the reader can still switch somewhere else.
-        store.set({ listPhase: 'error', listError: error.message, sessions: [], listTotal: 0 });
+    /**
+     * Ask the Host for the facts DSH's client snapshots do not carry: createdAt,
+     * the durable artifact size, and which ids are internal machinery.
+     *
+     * One request per archive-set change, never per page — that is what removes
+     * the ceiling instead of raising it. A request is skipped while the same key
+     * is already loading or already answered, so a re-render cannot storm the
+     * Host.
+     */
+    let metaSeq = 0;
+    async function loadMeta(key, options = {}) {
+      const force = options.force === true;
+      if (!force) {
+        if (store.state.metaPhase === 'loading' && store.state.metaKey === key) return;
+        // A failed read is retried on the next open instead of being frozen in
+        // place: the answer is cheap, and a stale failure is worse than a call.
+        if (store.state.meta !== null && store.state.metaKey === key && store.state.metaPhase !== 'error') return;
       }
+      const seq = ++metaSeq;
+      store.set({ metaPhase: 'loading', metaKey: key, metaError: '' });
+      try {
+        const result = await api('/meta' + (force ? '?refresh=1' : ''));
+        if (seq !== metaSeq) return;
+        store.set({
+          meta: {
+            createdAt: result.createdAt ?? {},
+            bytes: result.bytes ?? {},
+            mtime: result.mtime ?? {},
+            excluded: Array.isArray(result.excluded) ? result.excluded : []
+          },
+          metaPhase: 'ready',
+          metaError: ''
+        });
+        report('meta:fetched', JSON.stringify({
+          createdAt: Object.keys(result.createdAt ?? {}).length,
+          excluded: Array.isArray(result.excluded) ? result.excluded.length : 0
+        }));
+      } catch (error) {
+        // Keep the previous answer: without createdAt the list still renders,
+        // ordered by updatedAt, and the panel says what is missing.
+        if (seq !== metaSeq) return;
+        store.set({ metaPhase: 'error', metaError: String(error && error.message) });
+      }
+    }
+
+    /** Ensure the metadata for the archive set currently in the snapshot. */
+    const ensureMeta = (force = false) => loadMeta(archiveKey(), { force });
+
+    /** Comparison key for a workspace path — mirrors the Host half's rule. */
+    const workspacePathKey = (value) => {
+      if (typeof value !== 'string' || value === '') return '';
+      const path = value.replace(/[\\/]+/g, '/').replace(/\/+$/, '') || '/';
+      return (/^[a-z]:(?:\/|$)/i.test(path) || path.startsWith('//')) ? path.toLowerCase() : path;
+    };
+
+    /** Index workspace views by session and by path — the Host half's two tiers. */
+    function indexWorkspaces(items) {
+      const bySession = new Map();
+      const byPath = new Map();
+      const titles = new Map();
+      const paths = new Map();
+      for (const workspace of items ?? []) {
+        if (workspace === null || workspace === undefined) continue;
+        const id = String(workspace.workspaceId ?? workspace.id ?? '');
+        if (id === '') continue;
+        titles.set(id, workspace.title ?? id);
+        paths.set(id, typeof workspace.path === 'string' ? workspace.path : '');
+        const key = workspacePathKey(workspace.path);
+        if (key !== '') {
+          if (!byPath.has(key)) byPath.set(key, new Set());
+          byPath.get(key).add(id);
+        }
+        for (const sessionId of Array.isArray(workspace.sessionIds) ? workspace.sessionIds : []) {
+          const member = String(sessionId);
+          if (!bySession.has(member)) bySession.set(member, new Set());
+          bySession.get(member).add(id);
+        }
+      }
+      return { bySession, byPath, titles, paths };
+    }
+
+    /** Workspaces one session belongs to; membership wins over its cwd. */
+    function sessionWorkspaces(sessionId, cwd, index) {
+      const byMembership = index?.bySession?.get(String(sessionId));
+      if (byMembership !== undefined && byMembership.size > 0) return new Set(byMembership);
+      return new Set(index?.byPath?.get(workspacePathKey(cwd)) ?? []);
+    }
+
+    /**
+     * Derive the archive rows from the two snapshots plus the Host metadata.
+     *
+     * @param archivedIds - the archive set, in registry order.
+     * @param sessions - `{ ids, byId }` from `ctx.sessions.list`.
+     * @param workspaces - `{ items }` from `ctx.workspaces.list`.
+     * @param meta - the Host answer, or null before the first one lands.
+     * @returns rows (newest first), workspace options with counts, the
+     *   ungrouped count, and how many internal sessions were hidden.
+     */
+    function deriveRows({ archivedIds, sessions, workspaces, meta }) {
+      const byId = sessions?.byId ?? {};
+      const index = indexWorkspaces(workspaces?.items ?? []);
+      const excluded = new Set(Array.isArray(meta?.excluded) ? meta.excluded : []);
+      const createdAt = meta?.createdAt ?? {};
+      const bytes = meta?.bytes ?? {};
+      const mtime = meta?.mtime ?? {};
+      const rows = [];
+      let hidden = 0;
+      for (const archivedId of archivedIds ?? []) {
+        const id = String(archivedId);
+        if (excluded.has(id)) { hidden += 1; continue; }
+        const summary = byId[id];
+        const size = bytes[id];
+        // A row is live when either the snapshot knows the Session or its log
+        // is on disk. Only an id with neither is archive-set debris; it still
+        // gets a row (flagged) so the cleanup action stays reachable.
+        const persisted = summary !== undefined || size !== undefined || mtime[id] !== undefined;
+        const cwd = typeof summary?.cwd === 'string' ? summary.cwd : '';
+        const owners = sessionWorkspaces(id, cwd, index);
+        const workspaceId = owners.size > 0 ? [...owners][0] : '';
+        const display = typeof summary?.displayTitle === 'string' ? summary.displayTitle.trim() : '';
+        const fallback = typeof summary?.title === 'string' ? summary.title.trim() : '';
+        rows.push({
+          id,
+          title: display !== '' ? display : (fallback !== '' ? fallback : id),
+          workspaceId,
+          workspaceTitle: workspaceId === '' ? '' : (index.titles.get(workspaceId) ?? workspaceId),
+          cwd,
+          createdAt: Number.isFinite(createdAt[id]) ? createdAt[id] : undefined,
+          updatedAt: Number.isFinite(summary?.updatedAt) ? summary.updatedAt : undefined,
+          bytes: size,
+          persisted
+        });
+      }
+      // Newest first, by the same key the Host list used; a row whose metadata
+      // has not arrived falls back to updatedAt, and the id keeps ties stable.
+      const timeOf = (row) => (row.createdAt !== undefined
+        ? row.createdAt
+        : (row.updatedAt !== undefined ? row.updatedAt : (mtime[row.id] ?? 0)));
+      rows.sort((left, right) => timeOf(right) - timeOf(left) || left.id.localeCompare(right.id));
+      const counts = new Map();
+      let ungroupedCount = 0;
+      for (const row of rows) {
+        if (row.workspaceId === '') { ungroupedCount += 1; continue; }
+        counts.set(row.workspaceId, (counts.get(row.workspaceId) ?? 0) + 1);
+      }
+      const options = [...counts.entries()]
+        .map(([id, count]) => ({ id, title: index.titles.get(id) ?? id, path: index.paths.get(id) ?? '', count }))
+        .sort((left, right) => left.title.localeCompare(right.title));
+      return { rows, options, ungroupedCount, hidden };
     }
 
     async function loadTranscript(sessionId) {
@@ -488,60 +565,91 @@ window.__ModuleLoader__.load({
       const state = useStore();
       const onClose = props.onClose;
       const onRestore = props.onRestore;
+      const sessions = useSyncExternalStore(subscribeSessions, sessionsSnapshot, sessionsSnapshot);
+      const workspaces = useSyncExternalStore(subscribeWorkspaces, workspacesSnapshot, workspacesSnapshot);
+      const archivedIds = workspaces.archivedSessionIds ?? [];
+      const archivedKey = archivedIds.join('\0');
 
-      useEffect(() => { loadSessions(); }, []);
+      // The archive set is live: a Session archived elsewhere appears here, and
+      // one restored elsewhere leaves. The Host metadata is fetched when the
+      // panel opens and again only when that set changes — never per page,
+      // because there is no page.
+      useEffect(() => {
+        if (state.open) void ensureMeta();
+      }, [state.open, archivedKey]);
 
-      const filtered = useMemo(() => {
-        const query = state.query.trim().toLowerCase();
-        if (query === '') return state.sessions;
-        return state.sessions.filter(session => {
-          const haystack = `${session.title || ''} ${session.id} ${session.workspaceTitle || ''} ${session.cwd || ''}`.toLowerCase();
-          return haystack.includes(query);
-        });
-      }, [state.query, state.sessions]);
+      const derived = useMemo(
+        () => deriveRows({ archivedIds, sessions, workspaces, meta: state.meta }),
+        [archivedKey, sessions, workspaces, state.meta]
+      );
 
-      const selected = state.sessions.find(session => session.id === state.selectedId) || null;
+      // A workspace that lost its last archived Session stops being offered.
+      // The list answers as "all" immediately; the effect persists the choice
+      // so the selector cannot keep showing a value that is not in force.
+      const filterOffered = state.workspaceFilter === ''
+        || (state.workspaceFilter === 'ungrouped'
+          ? derived.ungroupedCount > 0
+          : derived.options.some(option => option.id === state.workspaceFilter));
+      const filterValue = filterOffered ? state.workspaceFilter : '';
+      const dropped = state.filterDropped || (!filterOffered && state.workspaceFilter !== '');
+      useEffect(() => {
+        if (!state.open || filterOffered) return;
+        store.set({ workspaceFilter: '', filterDropped: true, showCount: LIST_WINDOW });
+      }, [state.open, filterOffered, state.workspaceFilter]);
 
+      const query = state.query.trim().toLowerCase();
+      const byWorkspace = filterValue === ''
+        ? derived.rows
+        : derived.rows.filter(row => filterValue === 'ungrouped' ? row.workspaceId === '' : row.workspaceId === filterValue);
+      const filtered = query === ''
+        ? byWorkspace
+        : byWorkspace.filter(row => `${row.title} ${row.id} ${row.workspaceTitle} ${row.cwd}`.toLowerCase().includes(query));
+      const shown = filtered.slice(0, state.showCount);
+      const selected = derived.rows.find(row => row.id === state.selectedId) ?? null;
+
+      // The two snapshots and the metadata answer at different times; the panel
+      // only claims "loading" while there is nothing at all to draw.
+      const storesPending = workspaces.phase === 'pending' || sessions.phase === 'pending';
+      const listLoading = storesPending || (state.meta === null && state.metaPhase === 'loading');
       const listStatus = [];
-      if (state.listPhase === 'loading') listStatus.push(h('div', { key: 'loading', className: 'aav-empty' }, t('loading.list')));
-      if (state.listPhase === 'error') listStatus.push(h('div', { key: 'error', className: 'aav-empty aav-err' }, state.listError));
-      if (state.listPhase === 'ready' && filtered.length === 0) {
-        // Four different empties: no archive at all, ownership unreadable (so a
-        // filtered answer proves nothing), nothing in the chosen workspace, or
-        // the search box excluded everything that was loaded.
-        const emptyKey = state.groupingFailed && state.workspaceFilter !== ''
-          ? 'empty.grouping'
-          : state.listTotal === 0
-            ? (state.workspaceFilter === '' ? 'empty.archive' : 'empty.workspace')
-            : 'empty.filtered';
+      if (listLoading) listStatus.push(h('div', { key: 'loading', className: 'aav-empty' }, t('loading.list')));
+      if (state.metaPhase === 'error') {
+        listStatus.push(h('div', { key: 'metaError', className: 'aav-fieldNote aav-err' }, t('notice.metaFailed')));
+      }
+      if (!listLoading && filtered.length === 0) {
+        // Three different empties: no archive at all, nothing in the chosen
+        // workspace, or the search box excluded everything.
+        const emptyKey = derived.rows.length === 0
+          ? (filterValue === '' ? 'empty.archive' : 'empty.workspace')
+          : 'empty.filtered';
         listStatus.push(h('div', { key: 'empty', className: 'aav-empty' }, t(emptyKey)));
       }
 
-      const hiddenNote = state.listHidden > 0
-        ? h('div', { key: 'hidden', className: 'aav-rowMeta aav-hiddenNote' }, t('panel.hidden', { n: state.listHidden }))
+      const hiddenNote = derived.hidden > 0
+        ? h('div', { key: 'hidden', className: 'aav-rowMeta aav-hiddenNote' }, t('panel.hidden', { n: derived.hidden }))
         : null;
 
       // A dropped selection has to be stated where the selector is, not silently
       // applied: otherwise the dropdown just jumps back to "all" on its own.
-      const droppedNote = state.filterDropped && state.listPhase === 'ready' && state.workspaceFilter === ''
+      const droppedNote = dropped && !listLoading
         ? h('div', { key: 'dropped', className: 'aav-rowMeta aav-hiddenNote' }, t('notice.filterDropped'))
         : null;
 
-      const loadMore = state.listHasMore
+      // A rendering window over rows the panel already holds: clicking it asks
+      // the Host for nothing, so it cannot run into a request cap.
+      const showMore = filtered.length > shown.length
         ? h('button', {
             key: 'more',
             type: 'button',
             className: 'aav-row aav-loadMore',
-            onClick: () => loadSessions({ limit: store.state.listLimit + 50 })
-          }, state.listPhase === 'loading'
-            ? t('action.loadingMore')
-            : t('action.loadMore', { n: Math.max(0, state.listTotal - state.sessions.length) }))
+            onClick: () => store.set({ showCount: store.state.showCount + LIST_WINDOW })
+          }, t('action.showMore', { n: filtered.length - shown.length }))
         : null;
 
       const rows = [];
-      for (const session of filtered) {
+      for (const session of shown) {
         const dead = session.persisted === false;
-        const meta = [
+        const rowMeta = [
           formatTime(session.createdAt),
           session.workspaceTitle || '',
           formatBytes(session.bytes),
@@ -554,7 +662,7 @@ window.__ModuleLoader__.load({
           onClick: () => { if (!dead) loadTranscript(session.id); }
         },
           h('span', { className: 'aav-rowTitle' }, sessionLabel(session)),
-          h('span', { className: 'aav-rowMeta' }, meta)));
+          h('span', { className: 'aav-rowMeta' }, rowMeta)));
         // A row whose session is gone everywhere (no directory, no persistence
         // record, no checkpoint) is debris in the archive set: DSH's own session
         // manager cannot even list it. Offer the one useful action — drop it.
@@ -571,12 +679,9 @@ window.__ModuleLoader__.load({
                   headers: { 'content-type': 'application/json' },
                   body: JSON.stringify({ sessionId: session.id })
                 });
-                store.set({
-                  sessions: store.state.sessions.filter(entry => entry.id !== session.id),
-                  listTotal: Math.max(0, store.state.listTotal - 1),
-                  listHidden: store.state.listHidden,
-                  notice: t('notice.forgotten', { id: result?.sessionId ?? session.id })
-                });
+                // The archive set is a live snapshot: dropping the id there is
+                // what removes the row, so no local list surgery is needed.
+                store.set({ notice: t('notice.forgotten', { id: result?.sessionId ?? session.id }) });
               } catch (error) {
                 store.set({ notice: t('notice.forgetFailed', { message: error.message }) });
               }
@@ -586,37 +691,33 @@ window.__ModuleLoader__.load({
       }
 
       // The workspace selector sits above the search box: choosing a workspace
-      // is the coarse cut, typing is the fine one. Options and counts come from
-      // the Host's list payload, and the choice is applied by the Host over the
-      // whole archive — filtering the loaded page here would under-report.
-      const workspaceField = state.filterSupported === false
-        ? h('div', { key: 'unsupported', className: 'aav-fieldNote' }, t('filter.unavailable'))
-        : h('label', { key: 'workspace', className: 'aav-field' },
-            h('span', { className: 'aav-fieldLabel' }, t('filter.workspace')),
-            h('select', {
-              // No aria-label: the wrapping <label> supplies the accessible name,
-              // and an aria-label here would override the visible text.
-              className: 'aav-input aav-select',
-              value: state.workspaceFilter,
-              onChange: (event) => {
-                const value = event.target.value;
-                store.set({ workspaceFilter: value, filterDropped: false });
-                // Returning the promise is what lets the offline harness await
-                // the request, exactly like the refresh and load-more handlers.
-                return loadSessions({ workspace: value });
-              }
-            },
-              h('option', { value: '' }, state.visibleTotal > 0
-                ? t('filter.workspace.allN', { n: state.visibleTotal })
-                : t('filter.workspace.all')),
-              state.ungroupedCount > 0
-                ? h('option', { value: 'ungrouped' }, t('filter.workspace.ungrouped', { n: state.ungroupedCount }))
-                : null,
-              // The directory is the one thing that tells two same-titled
-              // workspaces apart, so it is the option's tooltip.
-              state.workspaceOptions.map(option => h('option', { key: option.id, value: option.id, title: option.path || option.title },
-                t('filter.workspace.option', { title: option.title, n: option.count })))
-            ));
+      // is the coarse cut, typing is the fine one. Both are applied to the full
+      // derived row set, so neither under-reports a workspace larger than the
+      // rendering window.
+      const workspaceField = h('label', { key: 'workspace', className: 'aav-field' },
+        h('span', { className: 'aav-fieldLabel' }, t('filter.workspace')),
+        h('select', {
+          // No aria-label: the wrapping <label> supplies the accessible name,
+          // and an aria-label here would override the visible text.
+          className: 'aav-input aav-select',
+          value: filterValue,
+          onChange: (event) => store.set({
+            workspaceFilter: event.target.value,
+            filterDropped: false,
+            showCount: LIST_WINDOW
+          })
+        },
+          h('option', { value: '' }, derived.rows.length > 0
+            ? t('filter.workspace.allN', { n: derived.rows.length })
+            : t('filter.workspace.all')),
+          derived.ungroupedCount > 0
+            ? h('option', { value: 'ungrouped' }, t('filter.workspace.ungrouped', { n: derived.ungroupedCount }))
+            : null,
+          // The directory is the one thing that tells two same-titled
+          // workspaces apart, so it is the option's tooltip.
+          derived.options.map(option => h('option', { key: option.id, value: option.id, title: option.path || option.title },
+            t('filter.workspace.option', { title: option.title, n: option.count })))
+        ));
 
       const search = h('div', { className: 'aav-sideTop' },
         workspaceField,
@@ -629,16 +730,16 @@ window.__ModuleLoader__.load({
           onChange: (event) => store.set({ query: event.target.value })
         }));
 
-      const side = h('div', { className: 'aav-side' }, search, h('div', { className: 'aav-list' }, listStatus, droppedNote, rows, loadMore, hiddenNote));
+      const side = h('div', { className: 'aav-side' }, search, h('div', { className: 'aav-list' }, listStatus, droppedNote, rows, showMore, hiddenNote));
       const main = h('div', { className: 'aav-main' }, h(Transcript, { t, state, session: selected, onRestore }));
       const body = h('div', { className: 'aav-body' }, side, main);
 
       const header = h('div', { className: 'aav-head' },
         h(Icon, { size: 18 }),
         h('h2', null, t('panel.title')),
-        h('span', { className: 'aav-headSub' }, t('panel.count', { shown: state.sessions.length, n: state.listTotal })),
+        h('span', { className: 'aav-headSub' }, t('panel.count', { shown: shown.length, n: filtered.length })),
         h('span', { className: 'aav-spacer' }),
-        h('button', { type: 'button', className: 'aav-btn', onClick: () => { store.set({ filterDropped: false }); return loadSessions({ force: true }); } }, t('action.refresh')),
+        h('button', { type: 'button', className: 'aav-btn', onClick: () => { store.set({ showCount: LIST_WINDOW, filterDropped: false }); return ensureMeta(true); } }, t('action.refresh')),
         h('button', { type: 'button', className: 'aav-btn', onClick: onClose }, t('action.close')));
 
       return h(React.Fragment, null, h('style', null, CSS), h('div', { className: 'aav-root' }, header, body));
@@ -679,8 +780,9 @@ window.__ModuleLoader__.load({
           'aria-label': label,
           title: wide ? undefined : label,
           onClick: () => {
+            // Opening is all it takes: the panel derives the list from the live
+            // snapshots and asks the Host once for the metadata it lacks.
             store.set({ open: true, filterDropped: false });
-            if (store.state.listPhase !== 'loading') loadSessions();
           }
         }, h(Icon, { size: 20 })),
         h(Dialog, { t, onRestore: props.onRestore }));
@@ -788,25 +890,38 @@ window.__ModuleLoader__.load({
             'aria-label': label,
             title: wide ? undefined : label,
             onClick: () => {
-              store.set({ open: true });
-              if (store.state.listPhase !== 'loading') loadSessions();
+              store.set({ open: true, filterDropped: false });
             }
           }, h(Icon, { size: 20 })));
       }
     }
 
     return {
-      inject: ['slots', 'locale', 'uiWorkspace'],
+      // `sessions` and `workspaces` are the list's data source: the snapshot
+      // DSH already holds for the sidebar, which is also where archived
+      // sessions live. No list route is declared here on purpose.
+      inject: ['slots', 'locale', 'uiWorkspace', 'sessions', 'workspaces'],
       /**
        * Testability seam: the offline harness (client-selftest.mjs) drives this
-       * state directly to render the transcript without a browser. A getter, so
-       * it always reflects the live store object, and a setter that goes through
-       * the real store so subscribers (the rendered tree) update. Nothing in the
-       * plugin or the Host reads either.
+       * state directly to render the transcript without a browser, and calls
+       * the row derivation with synthetic snapshots. A getter, so it always
+       * reflects the live store object, and a setter that goes through the real
+       * store so subscribers (the rendered tree) update. Nothing in the plugin
+       * or the Host reads either.
        */
       get __state() { return store.state; },
       __setState(patch) { store.set(patch); },
+      __deriveRows: deriveRows,
       apply(ctx) {
+        clientCtx = ctx;
+        // The archive set is live, and the metadata describes it: refetch when
+        // it changes while the panel is open. The Panel's own subscription
+        // repaints the rows; this one refreshes createdAt/size for new ids.
+        ctx.effect(() => {
+          const model = ctx.workspaces?.list;
+          if (model === undefined || typeof model.subscribe !== 'function') return () => {};
+          return model.subscribe(() => { if (store.state.open) void ensureMeta(); });
+        }, 'archive-viewer: archive set');
         const dictionaries = {
           zh: {
             'panel.title': '归档会话查看器',
@@ -814,8 +929,7 @@ window.__ModuleLoader__.load({
             'panel.count': '已列出 {shown} / 共 {n} 条',
             'panel.hidden': '已隐藏 {n} 条内部会话（记忆中枢等自动会话）',
             'action.refresh': '刷新',
-            'action.loadMore': '加载更多（还有 {n} 条）',
-            'action.loadingMore': '正在加载…',
+            'action.showMore': '显示更多（还有 {n} 条）',
             'action.close': '关闭',
             'action.restore': '恢复并继续对话',
             'action.hideInjected': '隐藏注入上下文',
@@ -826,13 +940,12 @@ window.__ModuleLoader__.load({
             'filter.workspace.allN': '全部工作区（{n}）',
             'filter.workspace.ungrouped': '未分组（{n}）',
             'filter.workspace.option': '{title}（{n}）',
-            'filter.unavailable': '工作区筛选需要重启 DSH 后生效',
             'notice.filterDropped': '所选工作区已没有归档会话，已切回「全部工作区」。',
+            'notice.metaFailed': '未能读取创建时间与日志大小（宿主无响应），列表仍可浏览。',
             'loading.list': '正在读取归档列表…',
             'loading.transcript': '正在读取会话正文…',
             'empty.archive': '当前没有已归档的会话',
             'empty.workspace': '该工作区没有已归档的会话',
-            'empty.grouping': '暂时读不到会话的归属工作区（宿主读取会话失败），无法按工作区筛选。',
             'empty.filtered': '没有匹配的会话',
             'empty.select': '从左侧选择一条归档会话',
             'empty.block': '（无正文）',
@@ -871,8 +984,7 @@ window.__ModuleLoader__.load({
             'panel.count': '{shown} of {n} listed',
             'panel.hidden': 'Hid {n} internal sessions (auto-created workbench sessions)',
             'action.refresh': 'Refresh',
-            'action.loadMore': 'Load more ({n} left)',
-            'action.loadingMore': 'Loading…',
+            'action.showMore': 'Show more ({n} left)',
             'action.close': 'Close',
             'action.restore': 'Restore and continue',
             'action.hideInjected': 'Hide injected context',
@@ -883,13 +995,12 @@ window.__ModuleLoader__.load({
             'filter.workspace.allN': 'All workspaces ({n})',
             'filter.workspace.ungrouped': 'Ungrouped ({n})',
             'filter.workspace.option': '{title} ({n})',
-            'filter.unavailable': 'Workspace filtering needs a DSH restart',
             'notice.filterDropped': 'That workspace has no archived sessions left; switched back to all workspaces.',
+            'notice.metaFailed': 'Could not read creation times or log sizes from the Host; the list still works.',
             'loading.list': 'Reading the archive list…',
             'loading.transcript': 'Reading the session log…',
             'empty.archive': 'No archived sessions',
             'empty.workspace': 'No archived sessions in this workspace',
-            'empty.grouping': 'Could not read session ownership from the Host, so filtering by workspace is unavailable.',
             'empty.filtered': 'No matching sessions',
             'empty.select': 'Pick an archived session on the left',
             'empty.block': '(no content)',
@@ -942,7 +1053,8 @@ window.__ModuleLoader__.load({
             store.set({ open: false });
             if (canOpen) ctx.uiWorkspace.openSession(sessionId);
             else store.set({ notice: translate('restored') });
-            loadSessions();
+            // The archive set is a live snapshot: unarchiving removes the row
+            // on its own, so there is no local list to refresh here.
           } catch (error) {
             store.set({ notice: translate('restore.failed').replace('{message}', error.message) });
           }

@@ -141,7 +141,11 @@ export function indexWorkspaces(workspaces) {
   const paths = new Map();
   for (const workspace of workspaces ?? []) {
     if (workspace === null || workspace === undefined) continue;
-    const id = String(workspace.id);
+    // The Host registry names the key `id`; the Client projection of the same
+    // row (what the reader derives from) names it `workspaceId`. One index
+    // accepts both so the two halves resolve ownership by the same rules.
+    const id = String(workspace.id ?? workspace.workspaceId ?? "");
+    if (id === "") continue;
     titles.set(id, workspace.title);
     paths.set(id, workspace.path);
     const key = workspacePathKey(workspace.path);
@@ -650,6 +654,67 @@ export async function transcriptFor(sessionQuery, sessionId) {
   };
 }
 
+/**
+ * Cheap metadata for an archive list the Client already holds.
+ *
+ * The Client derives the rows itself from DSH's own `sessions.list` and
+ * `workspaces.list` snapshots — titles, cwd, workspace membership and
+ * `updatedAt` are all there, so no list request is needed. Only three facts
+ * live exclusively in this half:
+ *
+ * - `createdAt`, from the registry's in-memory header index (the Client
+ *   summary carries `updatedAt` only);
+ * - the durable artifact size and mtime, from one directory walk that is reused
+ *   for {@link SCAN_TTL_MS};
+ * - the configured internal-machinery exclusion, a path rule only the Host
+ *   knows about.
+ *
+ * None of them needs a title fold, and none is paged, so the answer is one map
+ * over the whole archive set: its cost is bounded by the registry and by the
+ * cached walk, never by the size of a page.
+ *
+ * @param options.workspaceRegistry - registry exposing `archivedSessionIds`
+ *   and the in-memory `headers` index.
+ * @param options.artifactIndex - result of {@link scanSessionArtifacts}.
+ * @param options.excludedPaths - configured internal-machinery paths.
+ * @returns `{ createdAt, bytes, mtime, excluded, archivedIdCount }`. The
+ *   id-keyed maps are sparse: a stale archived id has no entry, and an id whose
+ *   log directory vanished has no size.
+ */
+export function archiveMeta({ workspaceRegistry, artifactIndex, excludedPaths }) {
+  const archivedIds = [...(workspaceRegistry?.archivedSessionIds ?? [])].map(String);
+  const headers = workspaceRegistry?.headers;
+  const headerOf = (id) => {
+    if (headers === undefined || headers === null) return undefined;
+    if (typeof headers.get === "function") return headers.get(id);
+    return headers[id];
+  };
+  const createdAt = {};
+  const bytes = {};
+  const mtime = {};
+  const excluded = [];
+  for (const id of archivedIds) {
+    const header = headerOf(id);
+    const artifact = artifactIndex?.get?.(id);
+    // Headers normally carry epoch milliseconds. An ISO string is accepted too,
+    // because the Client sorts numerically and a value it cannot compare would
+    // quietly drop that row to the bottom of the list.
+    const created = typeof header?.createdAt === "number"
+      ? header.createdAt
+      : (typeof header?.createdAt === "string" && header.createdAt !== "" ? Date.parse(header.createdAt) : Number.NaN);
+    if (Number.isFinite(created)) createdAt[id] = created;
+    if (artifact !== undefined) {
+      if (typeof artifact.bytes === "number" && Number.isFinite(artifact.bytes)) bytes[id] = artifact.bytes;
+      if (typeof artifact.mtime === "number" && Number.isFinite(artifact.mtime)) mtime[id] = artifact.mtime;
+    }
+    // The header's cwd is the value the list read uses; the artifact's project
+    // directory is the fallback when the index lost the header. A bare
+    // directory name still matches the default rule, which compares segments.
+    if (isExcludedWorkspace(header?.cwd ?? artifact?.project, excludedPaths)) excluded.push(id);
+  }
+  return { createdAt, bytes, mtime, excluded, archivedIdCount: archivedIds.length };
+}
+
 /** Archive-list payload: registry membership, workspace title, folded title,
  * artifact statistics. Persistence-derived values are best-effort per id so
  * one unreadable session cannot fail the whole list.
@@ -955,6 +1020,20 @@ export function apply(ctx, config = {}) {
         ? url.pathname.slice(API_PREFIX.length) || "/"
         : "/";
       try {
+        if (req.method === "GET" && path === "/meta") {
+          // The Client half's whole list rides on this one answer: titles and
+          // membership come from its own snapshots, so only the facts above are
+          // asked for, once, over the entire archive set.
+          const force = url.searchParams.get("refresh") === "1";
+          const artifactIndex = await artifacts(force);
+          const result = archiveMeta({
+            workspaceRegistry: ctx.workspaceRegistry,
+            artifactIndex,
+            excludedPaths
+          });
+          return sendJson(res, 200, { ok: true, result });
+        }
+
         if (req.method === "GET" && path === "/sessions") {
           // `refresh=1` is the explicit Refresh button: it drops both caches so
           // a just-renamed session shows its new title immediately. Normal
