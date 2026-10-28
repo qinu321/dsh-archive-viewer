@@ -364,6 +364,20 @@ window.__ModuleLoader__.load({
    row (a native select cannot ellipsize its own value). */
 .aav-select { width: auto; flex: 1 1 auto; min-width: 0; }
 .aav-list { flex: 1; overflow: auto; padding: 6px; }
+/* Windows' "automatically hide scroll bars" setting (and Chromium's overlay
+   bars) leaves both panes with no position cue: the bar flashes while you
+   scroll and fades. A custom scrollbar is painted regardless of that setting,
+   and the reserved gutter keeps the rows from shifting when it appears. */
+.aav-list, .aav-flow, .aav-pre { scrollbar-gutter: stable; }
+.aav-list::-webkit-scrollbar, .aav-flow::-webkit-scrollbar, .aav-pre::-webkit-scrollbar { width: 10px; height: 10px; }
+.aav-list::-webkit-scrollbar-track, .aav-flow::-webkit-scrollbar-track, .aav-pre::-webkit-scrollbar-track { background: transparent; }
+.aav-list::-webkit-scrollbar-thumb, .aav-flow::-webkit-scrollbar-thumb, .aav-pre::-webkit-scrollbar-thumb {
+  background: var(--dsw-alias-scrollbar-bg-l2, var(--dsw-alias-border-l2, rgb(128 128 128 / 45%)));
+  border: 2px solid transparent; border-radius: 999px; background-clip: padding-box; }
+.aav-list::-webkit-scrollbar-thumb:hover, .aav-flow::-webkit-scrollbar-thumb:hover,
+.aav-pre::-webkit-scrollbar-thumb:hover {
+  background: var(--dsw-alias-scrollbar-hover-l2, var(--dsw-alias-label-tertiary, rgb(128 128 128 / 65%)));
+  background-clip: padding-box; }
 .aav-row { display: block; width: 100%; text-align: left; padding: 8px 9px; margin-bottom: 4px; font: inherit; color: inherit;
   background: transparent; border: 1px solid transparent; border-radius: 9px; cursor: pointer; }
 .aav-row:hover { background: var(--dsw-alias-bg-layer-2); }
@@ -511,6 +525,15 @@ window.__ModuleLoader__.load({
       const state = props.state;
       const session = props.session;
       const onRestore = props.onRestore;
+      // One conversation per session: keeping the previous scroll offset would
+      // open the next log halfway through. Declared before the early returns so
+      // the hook order never changes between phases.
+      const flowRef = React.useRef(null);
+      const transcriptKey = state.transcript?.sessionId ?? state.selectedId ?? '';
+      useEffect(() => {
+        const node = flowRef.current;
+        if (node !== null) node.scrollTop = 0;
+      }, [transcriptKey]);
       if (state.rowPhase === 'loading') return h('div', { className: 'aav-empty' }, t('loading.transcript'));
       if (state.rowPhase === 'error') return h('div', { className: 'aav-empty aav-err' }, state.rowError);
       const transcript = state.transcript;
@@ -554,7 +577,7 @@ window.__ModuleLoader__.load({
         h('span', { className: 'aav-spacer' }),
         injectedToggle,
         restoreButton);
-      const flow = h('div', { className: 'aav-flow' },
+      const flow = h('div', { className: 'aav-flow', ref: flowRef },
         notices,
         items.map(item => h(MessageCard, { key: `${item.kind}:${item.seq}`, item, t })));
       return h(React.Fragment, null, head, banner, flow);
@@ -606,6 +629,17 @@ window.__ModuleLoader__.load({
         : byWorkspace.filter(row => `${row.title} ${row.id} ${row.workspaceTitle} ${row.cwd}`.toLowerCase().includes(query));
       const shown = filtered.slice(0, state.showCount);
       const selected = derived.rows.find(row => row.id === state.selectedId) ?? null;
+
+      // A different filter or query is a different list: carrying the previous
+      // offset into it lands the reader in the middle of rows they did not ask
+      // for. The window itself is not a scroll container, so only the scroller
+      // is reset.
+      const listRef = React.useRef(null);
+      const sliceKey = filterValue + '\u0000' + query;
+      useEffect(() => {
+        const node = listRef.current;
+        if (node !== null) node.scrollTop = 0;
+      }, [sliceKey]);
 
       // The two snapshots and the metadata answer at different times; the panel
       // only claims "loading" while there is nothing at all to draw.
@@ -730,7 +764,7 @@ window.__ModuleLoader__.load({
           onChange: (event) => store.set({ query: event.target.value })
         }));
 
-      const side = h('div', { className: 'aav-side' }, search, h('div', { className: 'aav-list' }, listStatus, droppedNote, rows, showMore, hiddenNote));
+      const side = h('div', { className: 'aav-side' }, search, h('div', { className: 'aav-list', ref: listRef }, listStatus, droppedNote, rows, showMore, hiddenNote));
       const main = h('div', { className: 'aav-main' }, h(Transcript, { t, state, session: selected, onRestore }));
       const body = h('div', { className: 'aav-body' }, side, main);
 

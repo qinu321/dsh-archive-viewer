@@ -191,6 +191,16 @@ check('the glyph is drawn at 20px', (() => {
   return icons.some(icon => icon.props.width === 20 && icon.props.height === 20);
 })(), JSON.stringify(wideElements.filter(element => element.props?.viewBox === '0 0 24 24').map(element => element.props?.width)));
 check('the button geometry is box-sizing-safe', /\.aav-footerBtn\s*\{[^}]*box-sizing:\s*border-box/.test(styleText), 'no border-box rule');
+// Windows' "hide scroll bars" setting leaves both panes without a position
+// cue: the scrollbar must be painted by us, not by the OS.
+check('both panes paint a permanent scrollbar',
+  /\.aav-list::-webkit-scrollbar[^{]*\{[^}]*width:\s*10px/.test(styleText)
+  && /\.aav-flow::-webkit-scrollbar[^{]*\{[^}]*width:\s*10px/.test(styleText), 'no always-on scrollbar rule');
+check('the scrollbar uses the host scrollbar colour tokens',
+  styleText.includes('--dsw-alias-scrollbar-bg-l2') && styleText.includes('--dsw-alias-scrollbar-hover-l2'),
+  'host scrollbar tokens missing');
+check('the scrollable panes reserve a stable gutter',
+  /\.aav-list,\s*\.aav-flow,\s*\.aav-pre\s*\{\s*scrollbar-gutter:\s*stable/.test(styleText), 'no stable gutter');
 
 let railError;
 try { slotRegistration.component({ ...ownerProps, wide: false }); } catch (error) { railError = error; }
@@ -270,6 +280,9 @@ check('the transcript flow renders without throwing', flowError === undefined,
 const flowElements = collect(flowTree);
 // Visible evidence when the assertions below fail: what the collector saw.
 check('the collector reached deep content', flowElements.length > 60, `collected ${flowElements.length} elements; classes=${JSON.stringify([...new Set(flowElements.map(element => String(element.props?.className ?? '')).filter(Boolean))].slice(0, 12))}`);
+check('the transcript scroller is ref-addressable so a new session can reset it',
+  flowElements.find(element => String(element.props?.className ?? '') === 'aav-flow')?.props?.ref !== undefined,
+  'aav-flow carries no ref');
 // Cards only: `aav-msgHead` / `aav-msgBody` also carry the "aav-msg" prefix.
 const cardCount = flowElements.filter(element => String(element.props?.className ?? '').split(' ')[0] === 'aav-msg').length;
 check('every transcript row produced a card', cardCount === 5, String(cardCount));
@@ -349,6 +362,9 @@ check('no session list route is requested at all',
   !metaCalls.some(url => url.includes('/sessions')), JSON.stringify(metaCalls));
 check('rows are newest first by the createdAt the Host supplied',
   JSON.stringify(rowTitles()) === JSON.stringify(['丙', '乙', '甲']), JSON.stringify(rowTitles()));
+check('the list scroller is ref-addressable so a filter change can reset it',
+  renderPanel().find(element => String(element.props?.className ?? '') === 'aav-list')?.props?.ref !== undefined,
+  'aav-list carries no ref');
 check('the header counts the rendering window over the derived total',
   renderPanel().some(element => element.props?.children === '已列出 3 / 共 3 条'),
   JSON.stringify(renderPanel().filter(element => element.props?.className === 'aav-headSub').map(element => element.props?.children)));
