@@ -153,6 +153,103 @@ const contextRows = buildRows([
 ], undefined);
 check("system-reminder and runtime-context messages are labelled injected", contextRows.items.filter(item => item.kind === "injected").length === 2, JSON.stringify(contextRows.items.map(item => item.kind)));
 check("a typed prompt stays a user row", contextRows.items.filter(item => item.kind === "user").length === 1 && contextRows.items.find(item => item.kind === "user").text === "真正手打的话");
+
+// --- 3a. who spoke: the producer's own source decides -----------------------
+// DSH documents `source.kind` as "who produced this" and keeps the union
+// merge-extensible, so a human prompt is the only kind "user". The old
+// allow-list knew three producer kinds plus two text prefixes; measured on this
+// library, 15,955 of 20,202 user/message events come from producers, and the
+// two reported symptoms were exactly that gap: a time-context timestamp
+// snapshot and a tool-jobs background-job notice both rendered as prompts.
+const producerRows = buildRows([
+  {
+    type: "user/message", seq: 1, time: 1,
+    data: {
+      content: [{ type: "text", text: "Time sampled while preparing turn 15, step 22: 2026-10-28T21:27:04+08:00[Asia/Shanghai]\nBrowser time zone for this request: Asia/Shanghai." }],
+      source: { kind: "time-context", form: "snapshot", sections: [{ name: "time-context", text: "…" }] }
+    }
+  },
+  {
+    type: "user/message", seq: 2, time: 2,
+    data: {
+      content: [{ type: "text", text: "background job pwsh-2766a49 (pwsh: npm view x) finished [status: completed, exit code: 0]. Output:\n{\n  \"name\": \"x\"\n}" }],
+      source: { kind: "tool-jobs", form: "notice", summary: "pwsh npm view x [status: completed, exit code: 0]" }
+    }
+  },
+  {
+    type: "user/message", seq: 3, time: 3,
+    data: { content: [{ type: "text", text: "这几处修一下" }], source: { kind: "user", rpcId: "rpc-1", clientTimeZone: "Asia/Shanghai" } }
+  }
+], undefined);
+check("a time-context snapshot is injected context, not a prompt",
+  producerRows.items[0].kind === "injected" && producerRows.items[0].label === "time-context",
+  JSON.stringify(producerRows.items[0]));
+check("a job notice is injected context, not a prompt",
+  producerRows.items[1].kind === "injected" && producerRows.items[1].label === "tool-jobs",
+  JSON.stringify(producerRows.items[1]));
+check("a job notice carries the one-line account DSH committed to the log",
+  producerRows.items[1].notice === "pwsh npm view x [status: completed, exit code: 0]",
+  JSON.stringify(producerRows.items[1].notice));
+check("the job notice keeps its full payload for the reader",
+  producerRows.items[1].text.endsWith("{\n  \"name\": \"x\"\n}"), JSON.stringify(producerRows.items[1].text));
+check("only the human prompt is a user row",
+  producerRows.items.filter(item => item.kind === "user").length === 1 && producerRows.items[2].text === "这几处修一下",
+  JSON.stringify(producerRows.items.map(item => item.kind)));
+check("a user row keeps the source that produced it", producerRows.items[2].source === "user", String(producerRows.items[2].source));
+
+// A relayed message (another session or agent speaking) is real conversation,
+// not context: it gets its own kind so it stays visible while no longer
+// reading as the human typing in this session.
+const relayRows = buildRows([
+  { type: "user/message", seq: 1, time: 1, data: { content: [{ type: "text", text: "[dsh-bridge] 另一会话的消息" }], source: { kind: "plugin:dsh-bridge", form: "relay" } } },
+  { type: "user/message", seq: 2, time: 2, data: { content: [{ type: "text", text: "<system-reminder>skills</system-reminder>" }], source: { kind: "skill-catalog", form: "catalog" } } }
+], undefined);
+check("a relayed message is its own row kind, labelled by producer",
+  relayRows.items[0].kind === "relay" && relayRows.items[0].label === "plugin:dsh-bridge",
+  JSON.stringify(relayRows.items[0]));
+check("a relay is not hidden with the injected context", isInjectedRow(relayRows.items[0]) === false);
+check("a catalog row is still injected context", relayRows.items[1].kind === "injected" && isInjectedRow(relayRows.items[1]) === true);
+
+// Legacy logs carry no source at all; the text prefix is the only signal left.
+const legacyRows = buildRows([
+  { type: "user/message", seq: 1, time: 1, data: { content: [{ type: "text", text: "老日志里的手打话" }] } },
+  { type: "user/message", seq: 2, time: 2, data: { content: [{ type: "text", text: "Current runtime context. cwd: E:\\x" }] } }
+], undefined);
+check("a log without any source still reads as a prompt", legacyRows.items[0].kind === "user", JSON.stringify(legacyRows.items[0]));
+check("the runtime-context prefix still catches a source-less log", legacyRows.items[1].kind === "injected", JSON.stringify(legacyRows.items[1]));
+
+// --- 3b. the seed marker is a lifecycle boundary, not an empty card --------
+// `session/end-seed` separates inherited or restored history from this
+// session's own work and carries no text, so as a notice row it painted an
+// empty card reading "（无正文）".
+const seedRows = buildRows([
+  { type: "user/message", seq: 1, time: 1, data: { content: [{ type: "text", text: "先聊这句" }], source: { kind: "user" } } },
+  { type: "session/end-seed", seq: 2, time: 2, data: {} },
+  { type: "session/end-seed", seq: 3, time: 3, data: { inherited: true } },
+  { type: "user/message", seq: 4, time: 4, data: { content: [{ type: "text", text: "恢复之后的话" }], source: { kind: "user" } } }
+], undefined);
+check("the seed marker becomes a boundary row",
+  seedRows.items.length === 3 && seedRows.items[1].kind === "boundary" && seedRows.items[1].label === "seed",
+  JSON.stringify(seedRows.items.map(item => item.kind)));
+check("the boundary row carries no empty text of its own", seedRows.items[1].text === undefined, JSON.stringify(seedRows.items[1].text));
+check("the inherited seed marker is not a row",
+  seedRows.items.filter(item => item.kind === "boundary").length === 1,
+  JSON.stringify(seedRows.items.map(item => item.kind)));
+
+// An empty row is noise: a notice whose value was empty and injected context
+// with no content at all are both dropped rather than painted as an empty card.
+const emptyRows = buildRows([
+  { type: "model/selection", seq: 1, time: 1, data: {} },
+  { type: "user/message", seq: 2, time: 2, data: { content: [], source: { kind: "runtime-context", form: "snapshot" } } },
+  { type: "user/message", seq: 3, time: 3, data: { content: [], source: { kind: "tool-jobs", form: "notice", summary: "后台任务结束" } } }
+], undefined);
+check("a notice with no value is not an empty row",
+  !emptyRows.items.some(item => item.kind === "notice"), JSON.stringify(emptyRows.items));
+check("injected context with no content is not an empty row",
+  !emptyRows.items.some(item => item.kind === "injected" && item.notice === undefined), JSON.stringify(emptyRows.items));
+check("a notice summary alone still earns its row",
+  emptyRows.items.length === 1 && emptyRows.items[0].notice === "后台任务结束", JSON.stringify(emptyRows.items));
+
 const assistant = built.items[2];
 check("assistant text comes from the stream, not the message fallback", assistant.text === "say hi", JSON.stringify(assistant.text));
 check("assistant reasoning comes from the stream", assistant.reasoning === "think ", JSON.stringify(assistant.reasoning));

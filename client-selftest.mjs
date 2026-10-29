@@ -257,6 +257,14 @@ const transcriptItems = [
   // A compaction boundary: the summary card, not a prompt the user typed.
   { kind: 'compaction', seq: 30, time: 30, text: '压缩摘要正文', shadowed: 12, provider: 'p' },
   { kind: 'injected', seq: 3, time: 3, label: 'agent-instructions', text: '<system-reminder>rules</system-reminder>' },
+  // A notice-form producer commits a one-line account and a payload: the row
+  // shows the account and folds the payload away.
+  { kind: 'injected', seq: 31, time: 31, label: 'tool-jobs', notice: 'pwsh npm view x [status: completed, exit code: 0]', text: 'background job pwsh-1 finished [status: completed, exit code: 0]. Output:\n{\n  "name": "x"\n}' },
+  // A lifecycle boundary, not a message: no body, so it must not reach the
+  // "（无正文）" placeholder.
+  { kind: 'boundary', seq: 32, time: 1789561789431, label: 'seed' },
+  // Another session or agent speaking: visible, but not attributed to the human.
+  { kind: 'relay', seq: 33, time: 33, label: 'plugin:dsh-bridge', text: '另一会话转述的话' },
   { kind: 'user', seq: 4, time: 4, text: '手打的话', source: 'user' },
   { kind: 'assistant', seq: 5, time: 5, text: '回答', reasoning: '想想', model: 'm', provider: 'p', usage: { input: 1, output: 2 } },
   { kind: 'tool', seq: 6, time: 6, name: 'read', callId: 'c1', paired: true, args: '{\n  "file_path": "E:\\\\x"\n}', result: '文件内容' },
@@ -281,7 +289,7 @@ check('the factory exposes its store for the offline harness', probeState !== un
 setProbeState({
   open: true,
   rowPhase: 'ready',
-  transcript: { sessionId: 'session-x', header: { id: 'session-x', version: 4, createdAt: 1, cwd: 'E:\\\\x' }, items: transcriptItems, rowCount: transcriptItems.length, eventCount: 9, injectedCount: 1, callCount: 2, usage: { input: 1, output: 2, calls: 1 } }
+  transcript: { sessionId: 'session-x', header: { id: 'session-x', version: 4, createdAt: 1, cwd: 'E:\\\\x' }, items: transcriptItems, rowCount: transcriptItems.length, eventCount: 9, injectedCount: 2, callCount: 2, usage: { input: 1, output: 2, calls: 1 } }
 });
 check('the harness state actually reached the store', probeInstance.__state.open === true && probeInstance.__state.transcript !== null,
   JSON.stringify({ open: probeInstance.__state.open, hasTranscript: probeInstance.__state.transcript !== null }));
@@ -300,8 +308,10 @@ check('the transcript scroller is ref-addressable so a new session can reset it'
   flowElements.find(element => String(element.props?.className ?? '') === 'aav-flow')?.props?.ref !== undefined,
   'aav-flow carries no ref');
 // Cards only: `aav-msgHead` / `aav-msgBody` also carry the "aav-msg" prefix.
+// Visible cards here: compaction, relay, user, assistant and three tool rows —
+// the two injected rows are hidden by default.
 const cardCount = flowElements.filter(element => String(element.props?.className ?? '').split(' ')[0] === 'aav-msg').length;
-check('every transcript row produced a card', cardCount === 6, String(cardCount));
+check('every transcript row produced a card', cardCount === 7, String(cardCount));
 check('a compaction boundary renders its own card',
   flowElements.some(element => String(element.props?.className ?? '') === 'aav-msg aav-compaction'),
   JSON.stringify([...new Set(flowElements.map(element => String(element.props?.className ?? '')))].slice(0, 12)));
@@ -313,6 +323,37 @@ check('the compaction summary sits behind a collapsed summary control',
   flowElements.some(element => element.type === 'summary' && element.props?.children === '查看压缩摘要'));
 check('the compaction summary text is present once expanded',
   flowElements.some(element => element.type === 'pre' && String(element.props?.children ?? '') === '压缩摘要正文'));
+// The seed marker is a lifecycle boundary. As a notice it painted an empty card
+// reading "（无正文）"; it must render exactly one localized divider line and
+// must not fall through to the empty-body placeholder.
+const padStamp = (value) => String(value).padStart(2, '0');
+// Same rendering the panel uses, so the expected string is exact and the test
+// does not depend on the machine's time zone.
+const stampOf = (value) => {
+  const date = new Date(value);
+  return `${date.getFullYear()}-${padStamp(date.getMonth() + 1)}-${padStamp(date.getDate())} ${padStamp(date.getHours())}:${padStamp(date.getMinutes())}`;
+};
+const boundaryTime = 1789561789431;
+check('the seed boundary renders one localized divider line',
+  flowElements.some(element => String(element.props?.className ?? '') === 'aav-turn'
+    && String(element.props?.children ?? '') === `继承/恢复的历史到此为止 · ${stampOf(boundaryTime)}`),
+  JSON.stringify(flowElements.filter(element => String(element.props?.className ?? '') === 'aav-turn').map(element => element.props?.children)));
+check('the seed boundary does not render the empty-body placeholder',
+  !flowElements.some(element => String(element.props?.children ?? '') === '（无正文）'),
+  JSON.stringify(flowElements.filter(element => String(element.props?.children ?? '').includes('无正文')).map(element => element.props?.children)));
+// A relayed message stays visible while it stops reading as the human typing.
+check('a relayed message renders as its own card',
+  flowElements.some(element => String(element.props?.className ?? '') === 'aav-msg aav-relay'),
+  JSON.stringify([...new Set(flowElements.map(element => String(element.props?.className ?? '')))].slice(0, 12)));
+check('the relayed card names the relaying producer',
+  flowElements.some(element => String(element.props?.children ?? '') === `转述 · plugin:dsh-bridge · ${stampOf(33)}`),
+  JSON.stringify(flowElements.filter(element => String(element.props?.className ?? '') === 'aav-msgHead').map(element => element.props?.children).slice(0, 8)));
+check('the relayed body is shown, not hidden',
+  flowElements.some(element => String(element.props?.className ?? '') === 'aav-msgBody' && element.props?.children === '另一会话转述的话'));
+check('the relayed row is not counted as hidden injected context',
+  flowElements.some(element => String(element.props?.className ?? '') === 'aav-banner'
+    && element.props?.children === '已隐藏 2 条注入上下文（系统提示、运行时快照、技能目录、时间与任务通知等）。'),
+  JSON.stringify(flowElements.filter(element => String(element.props?.className ?? '') === 'aav-banner').map(element => element.props?.children)));
 check('the tool row shows its tool name', flowElements.some(element => String(element.props?.className ?? '') === 'aav-toolName' && element.props.children === 'read'));
 check('an unnamed tool row says so instead of inventing a name', flowElements.some(element => String(element.props?.className ?? '') === 'aav-toolName' && element.props.children === '(未记录工具名)'));
 check('an unpaired result is badged', flowElements.some(element => String(element.props?.className ?? '') === 'aav-badge' && element.props.children === '仅结果'));
@@ -324,6 +365,19 @@ check('injected rows are hidden by default', !flowElements.some(element => Strin
 setProbeState({ hideInjected: false });
 const shownElements = collect(expandAll(probeRegistration.component(ownerProps)));
 check('flipping the toggle brings injected rows back', shownElements.some(element => String(element.props?.className ?? '').includes('aav-injected')));
+// A notice-form producer commits a one-line account ("shown without expanding
+// the row"). The row must show that account as its body and fold the payload
+// away instead of dumping a background job's whole JSON output inline.
+check('a notice-form injected row shows the committed one-line account',
+  shownElements.some(element => String(element.props?.className ?? '') === 'aav-msgBody aav-noticeLine'
+    && element.props?.children === 'pwsh npm view x [status: completed, exit code: 0]'),
+  JSON.stringify(shownElements.filter(element => String(element.props?.className ?? '').includes('noticeLine')).map(element => element.props?.children)));
+check('the notice payload sits behind a collapsed control',
+  shownElements.some(element => element.type === 'summary' && element.props?.children === '查看原始内容'));
+check('the notice payload itself is still rendered once expanded',
+  shownElements.some(element => element.type === 'pre'
+    && String(element.props?.children ?? '') === 'background job pwsh-1 finished [status: completed, exit code: 0]. Output:\n{\n  "name": "x"\n}'),
+  JSON.stringify(shownElements.filter(element => element.type === 'pre').map(element => String(element.props?.children ?? '').slice(0, 40))));
 setProbeState({ hideInjected: true, open: false, rowPhase: 'idle', transcript: null });
 
 // --- 5f. the list is derived from DSH's own Client snapshots ---------------

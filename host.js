@@ -432,9 +432,58 @@ export function collectCallMeta(events) {
 }
 
 /** Whether one rendered row is Harness-injected context rather than something
- * the user typed or the model said. Drives the reader's hide-injected toggle. */
+ * the user typed or the model said. Drives the reader's hide-injected toggle.
+ * A relayed message (another session or agent speaking) is not injected: it is
+ * part of what the model was answering, so it stays visible under its producer
+ * label instead of disappearing with the context rows. */
 export function isInjectedRow(row) {
   return row.kind === "injected";
+}
+
+/**
+ * The display row for one `user/message` event.
+ *
+ * DSH's own contract decides who spoke, not a list of producer names: a prompt
+ * the human typed is the only `user/message` whose `source.kind` is `"user"`
+ * (it also carries the `rpcId` it was claimed from). Every other kind is a
+ * producer's injected context, and the union is merge-extensible — each plugin
+ * declares its own kind — so enumerating kinds here misreads every producer
+ * added later. Measured on this library: of 20,202 `user/message` events,
+ * 4,247 were `user` and 15,955 came from producers (`runtime-context`,
+ * `time-context`, `plugin:*` relays, `tool-jobs`, `user-approval`, …). The old
+ * allow-list knew three kinds plus two text prefixes, so the timestamp snapshot
+ * and the background-job notice both read as prompts the human never typed.
+ *
+ * Three shapes come out of it:
+ *
+ * - `user` — a human prompt (or a legacy log with no source at all);
+ * - `relay` — `source.form === "relay"`: another session or agent addressed
+ *   this one. It stays visible; only the attribution changes;
+ * - `injected` — everything else. A `notice`-form producer commits a one-line
+ *   `summary` to the log ("shown without expanding the row"), so it rides along
+ *   as `notice` and the Client can render the account instead of a wall of text.
+ *
+ * The text prefixes remain only as a fallback for logs with no `source` (older
+ * format generations); no real prompt in this library starts with them.
+ *
+ * @param base - `{ seq, time }` for the row.
+ * @param data - the `user/message` event's data.
+ * @returns the row to render.
+ */
+export function userMessageRow(base, data) {
+  const text = contentText(data.content);
+  const source = data.source !== null && typeof data.source === "object" ? data.source : {};
+  const producer = typeof source.kind === "string" ? source.kind : "";
+  const form = typeof source.form === "string" ? source.form : "";
+  // A compaction checkpoint is handled by the caller before this point.
+  const injected = (producer !== "" && producer !== "user")
+    || text.startsWith("<system-reminder>")
+    || text.startsWith("Current runtime context.");
+  if (!injected) return { ...base, kind: "user", text: clip(text), source: "user" };
+  if (form === "relay") return { ...base, kind: "relay", label: producer === "" ? "relay" : producer, text: clip(text) };
+  const row = { ...base, kind: "injected", label: producer !== "" ? producer : (form !== "" ? form : "context"), text: clip(text) };
+  if (form === "notice" && typeof source.summary === "string" && source.summary !== "") row.notice = source.summary;
+  return row;
 }
 
 /** Turn a raw event log into display rows: the conversation as it stood, with
@@ -502,21 +551,11 @@ export function buildRows(events, header, options = {}) {
           }
           break;
         }
-        const kind = data.source?.kind;
-        const text = contentText(data.content);
         // Harness-injected context (runtime snapshot, workspace instructions,
-        // skill catalog, hook notices) also arrives as a user message. Label it
-        // so it can be collapsed away from the actual conversation: measured on
-        // a real archived session it was 216,688 characters against 3,621
-        // characters of typed prompts.
-        const injected = kind === "system-prompt" || kind === "user-approval" || kind === "delegation"
-          || text.startsWith("<system-reminder>")
-          || text.startsWith("Current runtime context.");
-        if (injected) {
-          rows.push({ ...base, kind: "injected", label: kind ?? "context", text: clip(text) });
-        } else {
-          rows.push({ ...base, kind: "user", text: clip(text), source: kind ?? "user" });
-        }
+        // skill catalog, hook notices, job and time notices) also arrives as a
+        // user message and outweighs typed prompts by roughly six to one, so
+        // the producer's own `source` decides the row — see userMessageRow.
+        rows.push(userMessageRow(base, data));
         break;
       }
       case "assistant/message": {
@@ -649,14 +688,27 @@ export function buildRows(events, header, options = {}) {
         break;
       }
       case "session/end-seed":
-        if (data.inherited !== true) rows.push({ ...base, kind: "notice", label: "seed", text: "" });
+        // A log-only lifecycle marker: it separates inherited or restored
+        // history from the work this session did itself, and carries no text.
+        // As a plain notice it rendered as an empty card reading "（无正文）",
+        // which looks like a bug; it gets its own kind so the Client can draw
+        // one divider line instead. The inherited marker is the fork cut and
+        // stays out of the transcript.
+        if (data.inherited !== true) rows.push({ ...base, kind: "boundary", label: "seed" });
         break;
       default:
         break;
     }
   }
 
-  const filtered = rows.filter(row => row.kind !== "notice" || row.text !== "" || row.label === "seed");
+  // An empty row is noise, not information: a notice whose value was empty
+  // (nothing to say), and an injected context message that is empty apart from
+  // a committed notice summary (the summary is the row).
+  const filtered = rows.filter(row => {
+    if (row.kind === "notice") return row.text !== "";
+    if (row.kind === "injected") return row.text !== "" || row.notice !== undefined;
+    return true;
+  });
   const truncated = filtered.length > MAX_ROWS;
   const items = truncated ? filtered.slice(filtered.length - MAX_ROWS) : filtered;
   return {

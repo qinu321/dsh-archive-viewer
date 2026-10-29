@@ -405,6 +405,14 @@ window.__ModuleLoader__.load({
 .aav-badge { padding: 1px 6px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 999px; font-size: 10.5px;
   color: var(--dsw-alias-label-secondary); }
 .aav-injected { opacity: .72; }
+/* A relayed message (another session or agent speaking): visible like a
+   message, since the model was answering it, but the left edge and the header
+   say it is not the human typing in this session. */
+.aav-relay { border-left: 3px solid var(--dsw-alias-border-l2); }
+.aav-relay .aav-msgHead { color: var(--dsw-alias-label-primary); }
+/* The one-line account a notice-form context producer committed: the body of
+   the row when its payload is folded away. */
+.aav-noticeLine { font-size: 12px; color: var(--dsw-alias-label-secondary); }
 /* A compaction boundary: it is a system event, so it reads quieter than a
    message but stays distinct from the injected-context rows. */
 .aav-compaction { border-color: var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-1); }
@@ -484,6 +492,13 @@ window.__ModuleLoader__.load({
       if (item.kind === 'title') {
         return h('div', { className: 'aav-turn' }, t('title.row', { title: item.text }));
       }
+      // A lifecycle marker, not a message: one quiet line where inherited or
+      // restored history ends. It has no body of its own, so it must not fall
+      // through to the "(no content)" placeholder below.
+      if (item.kind === 'boundary') {
+        const text = [t('boundary.seed'), item.time ? formatTime(item.time) : ''].filter(Boolean).join(' · ');
+        return h('div', { className: 'aav-turn' }, text);
+      }
       // A compaction is not a message the user typed: it is the summary DSH
       // wrote into the model context in place of an earlier span. The span
       // itself stays in the log above, so this card explains the boundary
@@ -524,14 +539,24 @@ window.__ModuleLoader__.load({
         const head = [];
         if (item.kind === 'user') head.push(t('role.user'));
         else if (item.kind === 'assistant') head.push(t('role.assistant'));
+        // A relay is another session or agent speaking, so the row says who
+        // relayed it instead of letting it read as the human typing.
+        else if (item.kind === 'relay') head.push(item.label ? `${t('role.relay')} · ${item.label}` : t('role.relay'));
         else head.push(item.label || item.kind);
         head.push(...metaParts);
         header = h('div', { className: 'aav-msgHead' }, head.filter(Boolean).join(' · '));
       }
 
       const className = 'aav-msg' + (item.kind === 'user' ? ' aav-user' : '')
+        + (item.kind === 'relay' ? ' aav-relay' : '')
         + (item.kind === 'tool' ? ' aav-tool' : '')
         + (item.kind === 'injected' ? ' aav-injected' : '');
+
+      // A notice-form context producer commits a one-line account to the log
+      // ("shown without expanding the row"). Render that line as the body and
+      // keep the payload behind a fold: without this, a background job's whole
+      // JSON output sat where the notice meant one line.
+      const notice = item.kind === 'injected' && typeof item.notice === 'string' && item.notice !== '' ? item.notice : '';
 
       const body = [];
       if (item.kind === 'assistant' && item.reasoning) {
@@ -539,8 +564,17 @@ window.__ModuleLoader__.load({
           h('summary', { className: 'aav-summary' }, t('reasoning.show')),
           h('pre', { className: 'aav-pre' }, item.reasoning)));
       }
+      if (notice !== '') {
+        body.push(h('div', { key: 'notice', className: 'aav-msgBody aav-noticeLine' }, notice));
+      }
       if (item.text && item.text !== '') {
-        body.push(h('div', { key: 'text', className: 'aav-msgBody' }, item.text));
+        if (notice === '') {
+          body.push(h('div', { key: 'text', className: 'aav-msgBody' }, item.text));
+        } else if (item.text !== notice) {
+          body.push(h('details', { key: 'text' },
+            h('summary', { className: 'aav-summary' }, t('injected.raw')),
+            h('pre', { className: 'aav-pre' }, item.text)));
+        }
       }
       if (item.kind === 'tool') {
         if (item.args && item.args !== '') {
@@ -1033,7 +1067,7 @@ window.__ModuleLoader__.load({
             'badge.interrupted': '被打断',
             'banner.readonly': '归档状态未被改动，此视图不写入任何会话状态。',
             'notice.truncated': '仅显示最近 {n} 条记录，更早的内容未在此视图加载。',
-            'notice.injectedHidden': '已隐藏 {n} 条注入上下文（系统提示、运行时快照、技能目录等）。',
+            'notice.injectedHidden': '已隐藏 {n} 条注入上下文（系统提示、运行时快照、技能目录、时间与任务通知等）。',
             'compaction.label': '上下文压缩',
             'compaction.shadowed': '折叠了 {n} 条更早的记录',
             'compaction.show': '查看压缩摘要',
@@ -1041,7 +1075,10 @@ window.__ModuleLoader__.load({
             'compaction.empty': '（这次压缩没有留下摘要文本）',
             'role.user': '用户',
             'role.assistant': '助手',
+            'role.relay': '转述',
             'role.tool': '工具 · {name}',
+            'boundary.seed': '继承/恢复的历史到此为止',
+            'injected.raw': '查看原始内容',
             'tool.unknown': '(未记录工具名)',
             'tool.resultOnly': '仅结果',
             'reasoning.show': '思考过程',
@@ -1092,7 +1129,7 @@ window.__ModuleLoader__.load({
             'badge.interrupted': 'interrupted',
             'banner.readonly': 'Archive state untouched; this view writes no session state.',
             'notice.truncated': 'Showing the {n} most recent rows; earlier content is not loaded here.',
-            'notice.injectedHidden': 'Hid {n} injected-context rows (system prompt, runtime snapshot, skill catalog).',
+            'notice.injectedHidden': 'Hid {n} injected-context rows (system prompt, runtime snapshot, skill catalog, time and job notices).',
             'compaction.label': 'Context compaction',
             'compaction.shadowed': 'folded {n} earlier records',
             'compaction.show': 'Show the compaction summary',
@@ -1100,7 +1137,10 @@ window.__ModuleLoader__.load({
             'compaction.empty': '(this compaction left no summary text)',
             'role.user': 'User',
             'role.assistant': 'Assistant',
+            'role.relay': 'Relayed',
             'role.tool': 'Tool · {name}',
+            'boundary.seed': 'Inherited or restored history ends here',
+            'injected.raw': 'Show the raw content',
             'tool.unknown': '(tool name not logged)',
             'tool.resultOnly': 'result only',
             'reasoning.show': 'Reasoning',

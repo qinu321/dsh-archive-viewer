@@ -48,6 +48,12 @@ DSH 的官方界面**不允许把已归档会话显示为当前视图**（`dsh-c
 
 渲染规则：
 
+- **谁在说话由事件的 `source` 决定，不靠枚举 kind 白名单**。DSH 的口径是：人类手打的消息是唯一 `source.kind === "user"` 的 `user/message`，其余 kind 都是某个 producer 的注入上下文，而且这个联合类型可被插件扩展（每个 producer 自己声明 kind），所以在这里抄一份名单等于给「以后新增的 producer」预留一次误判。实测本机 20,202 条 `user/message`：4,247 条是 `user`，15,955 条来自 producer（`runtime-context`、`time-context`、`plugin:*` 转述、`tool-jobs`、`user-approval` 等）。旧的白名单只知道三种 kind 加两条文本前缀，于是时间快照与后台任务通知都被读成了「用户发言」；
+  - `source.form === "notice"` 的 producer 会把一句话摘要提交进日志（`source.summary`），所以这类行读成「一行摘要 + 原文可展开」，而不是把整段 JSON 输出摊在正文里；
+  - `source.form === "relay"` 是别的会话/agent 转述进来的消息：它属于对话而不是上下文，因此单独成「转述 · <producer>」行，**可见**，不随「隐藏注入上下文」一起折叠；
+  - 没有 `source` 的老日志退回文本前缀判定（`<system-reminder>`、`Current runtime context.`）；
+- `session/end-seed` 是日志层的生命周期标记（继承/恢复的历史到此为止），本身没有正文：读成一行分隔线，不再生成一张「（无正文）」的空卡；带 `inherited: true` 的是 fork 切口，不渲染；
+- 没有值的 notice、没有内容也没有摘要的注入上下文都不生成卡片；
 - `compaction/summary` 渲染成一张「上下文压缩」卡片（折叠条数、摘要可展开，上限 24000 字），同一区间的检查点 `user/message` 跳过；
 - 工具结果配对时跳过 `replace` 的替代行，取原文；
 - agent loop 用来重置运行时上下文系统消息的空 `system/message` 跳过；
@@ -109,8 +115,8 @@ DSH 的官方界面**不允许把已归档会话显示为当前视图**（`dsh-c
 
 以下命令在**仓库检出**里运行（自检文件不随 npm 包发布）：
 
-```node selftest.mjs                            # 离线：折叠逻辑、路由、/meta、压缩/剪枝/空步骤、工作区解析/排序、客户端形状（195 项）
-node client-selftest.mjs                     # 离线客户端 harness：工厂/apply/slot/渲染、快照派生的列表、窗口与筛选（87 项）
+```node selftest.mjs                            # 离线：折叠逻辑、路由、/meta、压缩/剪枝/空步骤、谁在说话、工作区解析/排序、客户端形状（212 项）
+node client-selftest.mjs                     # 离线客户端 harness：工厂/apply/slot/渲染、快照派生的列表、窗口与筛选（96 项）
 ARCHIVE_VIEWER_LIVE=1 node selftest.mjs      # 追加真实归档库检查（条数/工件/陈旧 ID + /meta 与旧列表对账）
 ```
 

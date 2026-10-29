@@ -1,6 +1,6 @@
 {
   "name": "dsh-archive-viewer",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "description": "Read-only viewer for archived DSH sessions: browse the archive list and read a full transcript (including pre-compaction history) without unarchiving. | 归档会话只读查看器：不取消归档即可浏览归档列表、阅读完整对话与工具调用。",
   "author": "qinu321 (https://github.com/qinu321)",
   "license": "MIT",
